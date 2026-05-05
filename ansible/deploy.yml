@@ -80,7 +80,7 @@
         src: templates/env.uat.j2
         dest: "{{ app_dir }}/.env.uat"
         mode: "0600"
-      no_log: false
+      no_log: true
 
     # ── 4. Docker network ─────────────────────────────────────────────────────
     - name: Create Docker network if it does not exist
@@ -120,18 +120,21 @@
       when: postgres_running.rc != 0 or postgres_running.stdout | trim != 'true'
 
     # ── 6. Authenticate Docker to Artifact Registry ───────────────────────────
-    # GCP credentials are only used here — to pull the Docker image.
-    # --cred-file accepts the external_account (Workload Identity) format.
     - name: Copy GCP credentials file to server
       copy:
         src: "{{ gcp_creds_file }}"
         dest: "/tmp/gcp-pull-creds.json"
         mode: "0600"
 
+    - name: Activate GCP credentials
+      command: >
+        gcloud auth login
+        --cred-file=/tmp/gcp-pull-creds.json
+        --quiet
+
     - name: Configure Docker for Artifact Registry
       command: >
         gcloud auth configure-docker {{ gcp_region }}-docker.pkg.dev
-        --cred-file=/tmp/gcp-pull-creds.json
         --quiet
 
     - name: Remove GCP credentials file after Docker login
