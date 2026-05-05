@@ -257,6 +257,23 @@ jobs:
           chmod 600 "$CREDS_FILE"
           echo "path=${CREDS_FILE}" >> $GITHUB_OUTPUT
 
+      # Reconstruct the image name here instead of relying on cross-job outputs.
+      # Same formula as build-and-push — deterministic from secrets + git context.
+      - name: Compute image name
+        id: image
+        run: |
+          SA="${{ secrets.GCP_SERVICE_ACCOUNT }}"
+          PROJECT_ID=$(echo "$SA" | sed 's/.*@//' | sed 's/\.iam\.gserviceaccount\.com//')
+          REGISTRY="${{ secrets.GCP_REGION }}-docker.pkg.dev"
+          SHA="${{ github.sha }}"
+          SHORT_SHA="${SHA:0:8}"
+          BRANCH="${{ github.ref_name }}"
+          IMAGE_TAG="${BRANCH}-${SHORT_SHA}"
+          IMAGE_FULL="${REGISTRY}/${PROJECT_ID}/d2c/app:${IMAGE_TAG}"
+          echo "image_full=${IMAGE_FULL}" >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}"   >> $GITHUB_OUTPUT
+          echo "Image: ${IMAGE_FULL}"
+
       - name: Set up SSH key
         run: |
           mkdir -p ~/.ssh
@@ -274,8 +291,8 @@ jobs:
 
       - name: Run Ansible deploy playbook
         env:
-          IMAGE_FULL: ${{ needs.build-and-push.outputs.image_full }}
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          IMAGE_FULL: ${{ steps.image.outputs.image_full }}
+          IMAGE_TAG: ${{ steps.image.outputs.image_tag }}
           GCP_REGION: ${{ secrets.GCP_REGION }}
           GCP_CREDS: ${{ steps.creds.outputs.path }}
         run: |
