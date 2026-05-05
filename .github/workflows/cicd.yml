@@ -208,12 +208,25 @@ jobs:
   # ============================================================
   # JOB 3 — Deploy to UAT server (uat branch only)
   # ============================================================
+  #
+  # SECRET FLOW:
+  #   UAT   → ansible/vars/vault.uat.yml (encrypted in git)
+  #           Ansible decrypts with ANSIBLE_VAULT_PASSWORD → writes .env.uat
+  #   PROD  → GCP Secret Manager via secret_manager.py at app startup
+  #
+  # GITHUB SECRETS NEEDED FOR THIS JOB:
+  #   UAT_SERVER_HOST          server IP
+  #   UAT_SERVER_USER          SSH username
+  #   UAT_SSH_PRIVATE_KEY      SSH private key
+  #   ANSIBLE_VAULT_PASSWORD   password used to encrypt vault.uat.yml
+  #   GCP_WORKLOAD_IDENTITY_PROVIDER  (for docker pull auth only)
+  #   GCP_SERVICE_ACCOUNT             (for docker pull auth only)
+  #   GCP_REGION                      (for docker pull auth only)
   deploy-uat:
     name: Deploy to UAT server
     runs-on: ubuntu-latest
     needs: build-and-push
     if: github.ref == 'refs/heads/uat'
-    environment: uat
 
     permissions:
       id-token: write
@@ -231,22 +244,18 @@ jobs:
       - name: Install Ansible
         run: pip install ansible==9.5.1
 
-      # Download the short-lived credentials file that the build job created.
-      # This file lets the UAT server authenticate to Artifact Registry to pull the image.
       - name: Download GCP credentials
         uses: actions/download-artifact@v4
         with:
           name: gcp-credentials
           path: /tmp/gcp-creds
 
-      # Find the credentials filename (it has a random name like gha-creds-xxxxx.json)
       - name: Locate credentials file
         id: creds
         run: |
           CREDS_FILE=$(ls /tmp/gcp-creds/*.json | head -1)
           chmod 600 "$CREDS_FILE"
           echo "path=${CREDS_FILE}" >> $GITHUB_OUTPUT
-          echo "Credentials file: ${CREDS_FILE}"
 
       - name: Set up SSH key
         run: |
@@ -255,18 +264,30 @@ jobs:
           chmod 600 ~/.ssh/uat_deploy_key
           ssh-keyscan -H ${{ secrets.UAT_SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
 
+      # Write vault password to a temp file so ansible-playbook can read it.
+      # --vault-password-file is more secure than --ask-vault-pass in CI
+      # because the password never appears in process listings or shell history.
+      - name: Write Ansible Vault password file
+        run: |
+          echo "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > /tmp/vault-pass.txt
+          chmod 600 /tmp/vault-pass.txt
+
       - name: Run Ansible deploy playbook
         run: |
           ansible-playbook ansible/deploy.yml \
             -i "${{ secrets.UAT_SERVER_HOST }}," \
             --private-key ~/.ssh/uat_deploy_key \
             --user "${{ secrets.UAT_SERVER_USER }}" \
+            --vault-password-file /tmp/vault-pass.txt \
             --extra-vars "image_full=${{ needs.build-and-push.outputs.image_full }}" \
             --extra-vars "image_tag=${{ needs.build-and-push.outputs.image_tag }}" \
             --extra-vars "gcp_region=${{ secrets.GCP_REGION }}" \
-            --extra-vars "gcp_project_id=${{ needs.build-and-push.outputs.project_id }}" \
             --extra-vars "gcp_creds_file=${{ steps.creds.outputs.path }}" \
             -v
+
+      - name: Remove vault password file
+        if: always()
+        run: rm -f /tmp/vault-pass.txt
 
       - name: Verify deployment health
         run: |

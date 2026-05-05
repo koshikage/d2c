@@ -3,46 +3,42 @@
 # Ansible Deploy Playbook — D2C Platform UAT
 # ============================================================
 #
-# HOW SECRETS WORK (new approach):
-#   The app's secret_manager.py fetches all secrets from GCP Secret Manager
-#   at container startup using Application Default Credentials (ADC).
+# SECRET FLOW (new Ansible Vault approach):
 #
-#   ADC credential chain (the SDK checks these in order):
-#     1. GOOGLE_APPLICATION_CREDENTIALS env var → points to a credentials file
-#     2. gcloud application-default credentials (~/.config/gcloud/...)
-#     3. GCP metadata server (works automatically on GCP VMs)
+#   UAT secrets live in ansible/vars/vault.uat.yml
+#   This file is encrypted with Ansible Vault and committed to git.
+#   On deploy, Ansible decrypts it using ANSIBLE_VAULT_PASSWORD (GitHub secret)
+#   and writes all values directly into /opt/d2c/.env.uat on the server.
 #
-#   We use option 1: copy the Workload Identity credentials file from the
-#   GitHub Actions runner to /opt/d2c/gcp-creds.json on the server.
-#   Set GOOGLE_APPLICATION_CREDENTIALS in .env.uat to point to that file.
-#   Set GCP_PROJECT_ID in .env.uat so secret_manager.py knows which project.
-#   The app calls secret_manager.py at startup → fetches all 6 secrets → done.
+#   The app reads /opt/d2c/.env.uat via --env-file at container start.
+#   ALL secrets (JWT, encryption key, DB password etc.) come from the vault.
+#   NO GCP credentials needed on the server for UAT.
+#   NO secret_manager.py called for UAT (that is production only).
 #
-# WHAT CREDENTIALS ARE NEEDED ON THE SERVER:
-#   File: /opt/d2c/gcp-creds.json
-#   Type: external_account (Workload Identity short-lived OIDC token)
-#   Access needed: roles/secretmanager.secretAccessor on the 6 d2c-* secrets
+# HOW ANSIBLE VAULT WORKS:
+#   1. vault.uat.yml contains variables like vault_jwt_secret_key: "..."
+#   2. ansible-vault encrypt vault.uat.yml → file becomes unreadable ciphertext
+#   3. At deploy time: ansible-playbook --vault-password-file ... → decrypts in memory
+#   4. Variables are available as {{ vault_jwt_secret_key }} in the playbook
+#   5. Ansible writes them into /opt/d2c/.env.uat on the server
+#   6. The file is never written to disk unencrypted anywhere except the server
 #
-#   This file is refreshed on every deploy (1-hour token, but we refresh it
-#   every deploy so it's always fresh when the container restarts).
-#
-# WHAT THE APP NEEDS IN .env.uat:
-#   GOOGLE_APPLICATION_CREDENTIALS=/opt/d2c/gcp-creds.json
-#   GCP_PROJECT_ID=your-project-id
-#   ENVIRONMENT=production
-#   (everything else is fetched from Secret Manager by secret_manager.py)
+# GITHUB SECRET NEEDED:
+#   ANSIBLE_VAULT_PASSWORD   the password used when encrypting vault.uat.yml
 #
 # VARIABLES PASSED IN (--extra-vars from cicd.yml):
 #   image_full       full image path with tag
 #   image_tag        short tag for logging
 #   gcp_region       e.g. asia-south2
-#   gcp_project_id   GCP project ID
-#   gcp_creds_file   path to credentials JSON on the GitHub Actions runner
+#   gcp_creds_file   path to GCP credentials file (for docker pull only)
 
 - name: Deploy D2C Platform to UAT
   hosts: all
   become: false
   gather_facts: true
+
+  vars_files:
+    - vars/vault.uat.yml    # decrypted by Ansible Vault at runtime
 
   vars:
     app_dir:        /opt/d2c
@@ -53,7 +49,6 @@
     db_container:   d2c-postgres
     db_name:        d2c_db
     db_user:        d2c
-    creds_dest:     /opt/d2c/gcp-creds.json
 
   tasks:
 
@@ -79,43 +74,22 @@
         - "{{ log_dir }}"
       become: true
 
-    # ── 3. Store GCP credentials on the server ────────────────────────────────
-    # The Workload Identity credentials file is copied from the GitHub Actions
-    # runner to the server. The app container mounts this file and uses it
-    # as Application Default Credentials to fetch secrets from Secret Manager.
-    # This file is refreshed on every deploy.
-    - name: Copy GCP credentials file to server
-      copy:
-        src: "{{ gcp_creds_file }}"
-        dest: "{{ creds_dest }}"
-        mode: "0600"
-        owner: "{{ ansible_user }}"
-      become: true
-
-    # ── 4. Write minimal .env.uat ─────────────────────────────────────────────
-    # Only non-secret config goes here. All secrets are fetched by
-    # secret_manager.py at app startup using GOOGLE_APPLICATION_CREDENTIALS.
-    # DO NOT put JWT_SECRET_KEY, ENCRYPTION_KEY etc. here — they come from
-    # Secret Manager at runtime, not from this file.
-    - name: Write /opt/d2c/.env.uat
+    # ── 3. Write .env.uat from Ansible Vault variables ────────────────────────
+    # vault.uat.yml was decrypted in memory by Ansible at playbook start.
+    # Variables like {{ vault_jwt_secret_key }} are now available.
+    # We write them directly into the .env.uat file on the server.
+    # no_log: true prevents the values from appearing in Ansible output.
+    - name: Write /opt/d2c/.env.uat from vault
       copy:
         dest: "{{ app_dir }}/.env.uat"
         mode: "0600"
         owner: "{{ ansible_user }}"
         content: |
-          # ── How secrets work ──────────────────────────────────────────────────
-          # GOOGLE_APPLICATION_CREDENTIALS points to the GCP credentials file.
-          # The app's secret_manager.py reads this at startup and fetches:
-          #   JWT_SECRET_KEY, ENCRYPTION_KEY, DB_PASSWORD,
-          #   SHOPIFY_CLIENT_SECRET, SHOPIFY_WEBHOOK_SECRET, META_APP_SECRET
-          # from GCP Secret Manager. Do NOT put those values here.
-          # ─────────────────────────────────────────────────────────────────────
+          # Generated by Ansible deploy — do not edit manually
+          # Source of truth: ansible/vars/vault.uat.yml (encrypted in git)
+          # To update a value: ansible-vault edit ansible/vars/vault.uat.yml → redeploy
 
-          # GCP credentials — used by secret_manager.py (Application Default Credentials)
-          GOOGLE_APPLICATION_CREDENTIALS={{ creds_dest }}
-          GCP_PROJECT_ID={{ gcp_project_id }}
-
-          # App behaviour
+          # ── App ────────────────────────────────────────────────────────────────
           ENVIRONMENT=production
           DEBUG=false
           LOG_LEVEL=INFO
@@ -125,16 +99,25 @@
           LOG_FILE_MAX_BYTES=10485760
           LOG_FILE_BACKUP_COUNT=5
 
-          # Database — password is fetched from Secret Manager at startup
-          # and assembled into the full URL by secret_manager.py
-          # For UAT (plain VPS, not Cloud SQL) we use TCP to the postgres container
-          DATABASE_URL=postgresql+asyncpg://{{ db_user }}:PENDING@{{ db_container }}:5432/{{ db_name }}
-          DATABASE_SYNC_URL=postgresql+psycopg2://{{ db_user }}:PENDING@{{ db_container }}:5432/{{ db_name }}
+          # ── Secrets (from Ansible Vault) ───────────────────────────────────────
+          JWT_SECRET_KEY={{ vault_jwt_secret_key }}
+          ENCRYPTION_KEY={{ vault_encryption_key }}
+          SHOPIFY_CLIENT_SECRET={{ vault_shopify_client_secret }}
+          SHOPIFY_WEBHOOK_SECRET={{ vault_shopify_webhook_secret }}
+          META_APP_SECRET={{ vault_meta_app_secret }}
+
+          # ── Database ───────────────────────────────────────────────────────────
+          DATABASE_URL=postgresql+asyncpg://{{ db_user }}:{{ vault_db_password }}@{{ db_container }}:5432/{{ db_name }}
+          DATABASE_SYNC_URL=postgresql+psycopg2://{{ db_user }}:{{ vault_db_password }}@{{ db_container }}:5432/{{ db_name }}
+          DB_PASSWORD={{ vault_db_password }}
           DB_POOL_SIZE=10
           DB_MAX_OVERFLOW=20
+
+          # ── GCP (not needed for UAT — secrets come from vault, not Secret Manager) ──
+          GCP_PROJECT_ID=
           CLOUD_SQL_INSTANCE=
 
-          # Integration endpoints (mock servers on the same Docker network)
+          # ── Integration mock servers ───────────────────────────────────────────
           SHOPIFY_CLIENT_ID=mock_shopify_client_id
           SHOPIFY_MOCK_BASE_URL=http://mock-shopify:8001
           META_APP_ID=mock_meta_app_id
@@ -142,30 +125,16 @@
 
           ALLOWED_ORIGINS=["http://{{ ansible_host }}","http://{{ ansible_host }}:8000"]
       become: true
-      no_log: false
+      no_log: true
 
-    # ── 5. Docker network ─────────────────────────────────────────────────────
+    # ── 4. Docker network ─────────────────────────────────────────────────────
     - name: Create Docker network if it does not exist
       command: docker network create {{ network_name }}
       register: network_result
       failed_when: network_result.rc != 0 and 'already exists' not in network_result.stderr
       changed_when: network_result.rc == 0
 
-    # ── 6. Postgres container ─────────────────────────────────────────────────
-    # DB_PASSWORD is fetched from Secret Manager by the app at startup.
-    # For the postgres container itself we read the secret directly via gcloud
-    # so the container is started with the correct password.
-    - name: Get DB password for postgres container startup
-      command: >
-        gcloud secrets versions access latest
-        --secret=d2c-db-password
-        --project={{ gcp_project_id }}
-        --quiet
-      register: db_pass_result
-      no_log: true
-      environment:
-        GOOGLE_APPLICATION_CREDENTIALS: "{{ creds_dest }}"
-
+    # ── 5. Postgres container ─────────────────────────────────────────────────
     - name: Check if Postgres container is running
       command: docker inspect -f "{{ '{{' }}.State.Running{{ '}}' }}" {{ db_container }}
       register: postgres_running
@@ -181,7 +150,7 @@
         --network {{ network_name }}
         --volume postgres_data:/var/lib/postgresql/data
         --env POSTGRES_USER={{ db_user }}
-        --env POSTGRES_PASSWORD={{ db_pass_result.stdout }}
+        --env POSTGRES_PASSWORD={{ vault_db_password }}
         --env POSTGRES_DB={{ db_name }}
         postgres:16-alpine
       when: postgres_running.rc != 0 or postgres_running.stdout | trim != 'true'
@@ -195,25 +164,27 @@
       until: pg_ready.rc == 0
       when: postgres_running.rc != 0 or postgres_running.stdout | trim != 'true'
 
-    # Update .env.uat DB URLs with the real password now that we have it
-    - name: Update DATABASE_URL with real DB password
-      replace:
-        path: "{{ app_dir }}/.env.uat"
-        regexp: 'PENDING'
-        replace: "{{ db_pass_result.stdout }}"
-      become: true
-      no_log: true
+    # ── 6. Authenticate Docker to Artifact Registry ───────────────────────────
+    # GCP credentials are only used here — to pull the Docker image.
+    # --cred-file accepts the external_account (Workload Identity) format.
+    - name: Copy GCP credentials file to server
+      copy:
+        src: "{{ gcp_creds_file }}"
+        dest: "/tmp/gcp-pull-creds.json"
+        mode: "0600"
 
-    # ── 7. Authenticate Docker to Artifact Registry ───────────────────────────
-    # Use --cred-file which accepts external_account (Workload Identity) format.
-    # activate-service-account only accepts service_account format — wrong type.
     - name: Configure Docker for Artifact Registry
       command: >
         gcloud auth configure-docker {{ gcp_region }}-docker.pkg.dev
-        --cred-file={{ creds_dest }}
+        --cred-file=/tmp/gcp-pull-creds.json
         --quiet
 
-    # ── 8. Pull new image ─────────────────────────────────────────────────────
+    - name: Remove GCP credentials file after Docker login
+      file:
+        path: /tmp/gcp-pull-creds.json
+        state: absent
+
+    # ── 7. Pull new image ─────────────────────────────────────────────────────
     - name: Pull new image from Artifact Registry
       command: docker pull {{ image_full }}
       register: pull_result
@@ -222,16 +193,15 @@
       debug:
         msg: "{{ pull_result.stdout_lines[-3:] }}"
 
-    # ── 9. Run Alembic migrations ─────────────────────────────────────────────
-    # The migration container needs GOOGLE_APPLICATION_CREDENTIALS mounted
-    # so secret_manager.py can fetch DB_PASSWORD to build the DATABASE_URL.
+    # ── 8. Run Alembic migrations ─────────────────────────────────────────────
+    # .env.uat contains the real DATABASE_URL (with vault password).
+    # No GCP credentials needed — secrets are already in the env file.
     - name: Run Alembic migrations
       command: >
         docker run --rm
         --name d2c-migrate-{{ ansible_date_time.epoch }}
         --network {{ network_name }}
         --env-file {{ app_dir }}/.env.uat
-        --volume {{ creds_dest }}:{{ creds_dest }}:ro
         {{ image_full }}
         alembic upgrade head
       register: migration_result
@@ -245,7 +215,7 @@
         msg: "Migration failed — old container still running.\n{{ migration_result.stderr }}"
       when: migration_result.rc != 0
 
-    # ── 10. Stop and remove old container ─────────────────────────────────────
+    # ── 9. Stop and remove old container ─────────────────────────────────────
     - name: Stop old container
       command: docker stop {{ container_name }}
       register: stop_result
@@ -258,10 +228,9 @@
       failed_when: rm_result.rc != 0 and 'No such container' not in rm_result.stderr
       changed_when: rm_result.rc == 0
 
-    # ── 11. Start new container ───────────────────────────────────────────────
-    # Mount the credentials file into the container at the same path.
-    # The app reads GOOGLE_APPLICATION_CREDENTIALS from .env.uat which points
-    # to /opt/d2c/gcp-creds.json — so we mount that file read-only.
+    # ── 10. Start new container ───────────────────────────────────────────────
+    # No volume mount for GCP credentials — not needed for UAT.
+    # All secrets are already in .env.uat from the vault.
     - name: Start new app container
       command: >
         docker run
@@ -272,7 +241,6 @@
         --publish 127.0.0.1:{{ container_port }}:8000
         --env-file {{ app_dir }}/.env.uat
         --volume {{ log_dir }}:/app/logs
-        --volume {{ creds_dest }}:{{ creds_dest }}:ro
         --log-driver json-file
         --log-opt max-size=50m
         --log-opt max-file=5
@@ -285,7 +253,7 @@
       debug:
         msg: "Started: {{ run_result.stdout[:12] }}"
 
-    # ── 12. Health check ──────────────────────────────────────────────────────
+    # ── 11. Health check ──────────────────────────────────────────────────────
     - name: Wait for app to pass health check
       uri:
         url: "http://localhost:{{ container_port }}/health"
@@ -302,7 +270,7 @@
         msg: "Container started but DB is unhealthy: {{ health.json }}"
       when: health.json.status == 'degraded'
 
-    # ── 13. Nginx setup ───────────────────────────────────────────────────────
+    # ── 12. Nginx setup ───────────────────────────────────────────────────────
     - name: Install nginx
       apt:
         name: nginx
@@ -345,7 +313,7 @@
         enabled: yes
       become: true
 
-    # ── 14. Prune old images ──────────────────────────────────────────────────
+    # ── 13. Prune old images ──────────────────────────────────────────────────
     - name: Remove dangling images
       command: docker image prune -f
       register: prune_result
