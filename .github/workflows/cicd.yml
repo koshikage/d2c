@@ -2,28 +2,46 @@
 # CI/CD Pipeline — D2C Platform
 # ============================================================
 #
-# BRANCH STRATEGY:
+# FULL FLOW (end to end):
 #
-#   uat  → build image → push to Artifact Registry → pull & run on UAT server
-#   main → build image → push to Artifact Registry → STOP (no auto-deploy)
+#   push → uat branch:
+#     1. Run unit tests
+#     2. Authenticate to GCP via Workload Identity (no SA key needed)
+#     3. Build Docker image tagged as  uat-{git-sha}
+#     4. Push image to GCP Artifact Registry
+#     5. SSH into UAT server via Ansible
+#     6. Copy the short-lived GCP credentials file to the server
+#     7. Docker on the server uses those credentials to pull the image
+#     8. Run Alembic migrations in a temp container
+#     9. Restart the app container with the new image
+#    10. Health check — fail the deploy if /health returns degraded
 #
-# WHY main does NOT auto-deploy:
-#   Production deploys are intentional. After this workflow pushes the image,
-#   a human runs the Cloud Run deploy step (or triggers it via a separate
-#   manual-approval workflow). This prevents an accidental push to main from
-#   taking down production.
+#   push → main branch:
+#     1. Run unit tests
+#     2. Build and push image tagged as  main-{git-sha}
+#     3. STOP — production deploy is manual (intentional)
 #
 # ============================================================
-# SECRETS REQUIRED IN GITHUB (Settings → Secrets → Actions):
+# SECRETS NEEDED IN GITHUB
+# Settings → Secrets and variables → Actions → New repository secret
 #
-#   GCP_WORKLOAD_IDENTITY_PROVIDER   full provider resource name
-#   GCP_SERVICE_ACCOUNT              service account email
-#   GCP_REGION                       e.g. asia-south2
+#   Already set (3 secrets):
+#     GCP_WORKLOAD_IDENTITY_PROVIDER   full provider resource name
+#     GCP_SERVICE_ACCOUNT              service account email
+#     GCP_REGION                       e.g. asia-south2
 #
-#   UAT_SERVER_HOST         IP or hostname of the UAT server     (add later)
-#   UAT_SERVER_USER         SSH user on the UAT server           (add later)
-#   UAT_SSH_PRIVATE_KEY     SSH private key for the UAT server   (add later)
+#   Still needed for UAT deploy (3 secrets):
+#     UAT_SERVER_HOST       IP address of your UAT server  e.g. 203.0.113.10
+#     UAT_SERVER_USER       SSH username                   e.g. ubuntu
+#     UAT_SSH_PRIVATE_KEY   SSH private key (full content including BEGIN/END lines)
 #
+# HOW TO GET THE UAT SERVER SECRETS:
+#   UAT_SERVER_HOST     → your VPS provider dashboard → server public IP
+#   UAT_SERVER_USER     → usually "ubuntu" for Ubuntu servers
+#   UAT_SSH_PRIVATE_KEY → run on your local machine:
+#                           ssh-keygen -t ed25519 -f ~/.ssh/d2c_uat -N ""
+#                           cat ~/.ssh/d2c_uat          ← this is the secret
+#                           cat ~/.ssh/d2c_uat.pub      ← add this to server authorized_keys
 # ============================================================
 
 name: CI/CD Pipeline
@@ -39,16 +57,12 @@ on:
       - main
 
 env:
-  REGION: ${{ secrets.GCP_REGION }}
-  # PROJECT_ID is extracted from GCP_SERVICE_ACCOUNT in the compute-tags step
-  # Format: d2c-cicd-sa@YOUR-PROJECT-ID.iam.gserviceaccount.com
-  # So we do NOT need a separate GCP_PROJECT_ID secret.
   REGISTRY: ${{ secrets.GCP_REGION }}-docker.pkg.dev
 
 jobs:
 
   # ============================================================
-  # JOB 1 — Tests (runs on every push and PR)
+  # JOB 1 — Tests (every push and PR)
   # ============================================================
   test:
     name: Run unit tests
@@ -70,15 +84,13 @@ jobs:
       - name: Run unit tests
         env:
           ENVIRONMENT: test
-          # Fixed test secrets — not real values, safe in CI logs
           JWT_SECRET_KEY: test_jwt_secret_for_ci_not_production
           ENCRYPTION_KEY: dGVzdF9lbmNyeXB0aW9uX2tleV9mb3JfdGVzdHM=
           SHOPIFY_WEBHOOK_SECRET: test_webhook_secret
-        run: |
-          pytest tests/unit/ -v --tb=short
+        run: pytest tests/unit/ -v --tb=short
 
   # ============================================================
-  # JOB 2 — Build & Push image (uat and main branches only)
+  # JOB 2 — Build & Push image (uat and main on push only)
   # ============================================================
   build-and-push:
     name: Build and push Docker image
@@ -86,17 +98,27 @@ jobs:
     needs: test
     if: github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main')
 
+    # id-token: write  — required for Workload Identity Federation.
+    #   GitHub injects $ACTIONS_ID_TOKEN_REQUEST_TOKEN only when this is set.
+    #   Without it the auth action fails with "did not inject token" error.
+    # contents: read   — required to checkout the repository.
+    permissions:
+      id-token: write
+      contents: read
+
     outputs:
-      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_tag:  ${{ steps.meta.outputs.image_tag }}
       image_full: ${{ steps.meta.outputs.image_full }}
+      image_path: ${{ steps.meta.outputs.image_path }}
+      branch:     ${{ steps.meta.outputs.branch }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ── Extract project ID from service account email ────────────
-      # GCP_SERVICE_ACCOUNT = d2c-cicd-sa@YOUR-PROJECT-ID.iam.gserviceaccount.com
-      # We extract YOUR-PROJECT-ID from it — no separate GCP_PROJECT_ID secret needed.
+      # Extract PROJECT_ID from GCP_SERVICE_ACCOUNT email.
+      # Format: d2c-cicd-sa@YOUR-PROJECT-ID.iam.gserviceaccount.com
+      # This means you do NOT need a separate GCP_PROJECT_ID secret.
       - name: Compute image tags
         id: meta
         run: |
@@ -116,17 +138,21 @@ jobs:
           echo "image_full=${IMAGE_FULL}"   >> $GITHUB_OUTPUT
           echo "branch=${BRANCH}"           >> $GITHUB_OUTPUT
 
-          echo "Project ID : ${PROJECT_ID}"
-          echo "Image      : ${IMAGE_FULL}"
+          echo "Project : ${PROJECT_ID}"
+          echo "Image   : ${IMAGE_FULL}"
 
-      # ── Authenticate to GCP via Workload Identity ─────────────
-      # No JSON key file needed. GitHub gets a short-lived OIDC token
-      # (expires in 1 hour). Works even when SA key creation is blocked.
+      # Workload Identity — GitHub gets a short-lived OIDC token (1 hour).
+      # create_credentials_file: true writes a credentials JSON to disk.
+      # We copy that same file to the UAT server in the deploy job so the
+      # server can also authenticate to pull the image — no SA key needed anywhere.
       - name: Authenticate to Google Cloud
+        id: auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+          export_environment_variables: true
 
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker ${{ env.REGISTRY }} --quiet
@@ -148,6 +174,21 @@ jobs:
           docker push ${{ steps.meta.outputs.image_full }}
           docker push ${{ steps.meta.outputs.image_path }}:${{ steps.meta.outputs.branch }}-latest
 
+      # Save the credentials file path as an output for the deploy job.
+      # GOOGLE_APPLICATION_CREDENTIALS is set automatically by the auth action.
+      - name: Export credentials file path
+        id: creds
+        run: echo "creds_file=${GOOGLE_APPLICATION_CREDENTIALS}" >> $GITHUB_OUTPUT
+
+      # Upload the credentials file as an artifact so the deploy job can download it.
+      # It is a short-lived token (1 hour) — safe to pass between jobs this way.
+      - name: Upload GCP credentials for deploy job
+        uses: actions/upload-artifact@v4
+        with:
+          name: gcp-credentials
+          path: ${{ steps.creds.outputs.creds_file }}
+          retention-days: 1
+
       - name: Summary
         run: |
           echo "### Image pushed" >> $GITHUB_STEP_SUMMARY
@@ -159,20 +200,18 @@ jobs:
           echo "| **Full image** | \`${{ steps.meta.outputs.image_full }}\` |" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================
-  # JOB 3 — Deploy to UAT server (DISABLED — add server secrets to enable)
+  # JOB 3 — Deploy to UAT server (uat branch only)
   # ============================================================
-  # To enable this job:
-  #   1. Add these secrets to GitHub:
-  #        UAT_SERVER_HOST       your server IP
-  #        UAT_SERVER_USER       e.g. ubuntu
-  #        UAT_SSH_PRIVATE_KEY   your SSH private key
-  #   2. Change   if: false   to   if: github.ref == 'refs/heads/uat'
   deploy-uat:
     name: Deploy to UAT server
     runs-on: ubuntu-latest
     needs: build-and-push
-    if: false   # <-- change to: github.ref == 'refs/heads/uat'  when you have server secrets
+    if: github.ref == 'refs/heads/uat'
     environment: uat
+
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - name: Checkout code
@@ -186,6 +225,23 @@ jobs:
       - name: Install Ansible
         run: pip install ansible==9.5.1
 
+      # Download the short-lived credentials file that the build job created.
+      # This file lets the UAT server authenticate to Artifact Registry to pull the image.
+      - name: Download GCP credentials
+        uses: actions/download-artifact@v4
+        with:
+          name: gcp-credentials
+          path: /tmp/gcp-creds
+
+      # Find the credentials filename (it has a random name like gha-creds-xxxxx.json)
+      - name: Locate credentials file
+        id: creds
+        run: |
+          CREDS_FILE=$(ls /tmp/gcp-creds/*.json | head -1)
+          chmod 600 "$CREDS_FILE"
+          echo "path=${CREDS_FILE}" >> $GITHUB_OUTPUT
+          echo "Credentials file: ${CREDS_FILE}"
+
       - name: Set up SSH key
         run: |
           mkdir -p ~/.ssh
@@ -193,30 +249,21 @@ jobs:
           chmod 600 ~/.ssh/uat_deploy_key
           ssh-keyscan -H ${{ secrets.UAT_SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
 
-      # Workload Identity creates a credentials file automatically.
-      # We pass its path to Ansible so Docker on the server can authenticate.
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-          create_credentials_file: true
-          export_environment_variables: true
-
       - name: Run Ansible deploy playbook
         env:
-          IMAGE_FULL: ${{ needs.build-and-push.outputs.image_full }}
-          IMAGE_TAG:  ${{ needs.build-and-push.outputs.image_tag }}
-          GCP_REGION: ${{ secrets.GCP_REGION }}
+          IMAGE_FULL:       ${{ needs.build-and-push.outputs.image_full }}
+          IMAGE_TAG:        ${{ needs.build-and-push.outputs.image_tag }}
+          GCP_REGION:       ${{ secrets.GCP_REGION }}
+          GCP_CREDS_FILE:   ${{ steps.creds.outputs.path }}
         run: |
           ansible-playbook ansible/deploy.yml \
             -i "${{ secrets.UAT_SERVER_HOST }}," \
             --private-key ~/.ssh/uat_deploy_key \
-            --user ${{ secrets.UAT_SERVER_USER }} \
+            --user "${{ secrets.UAT_SERVER_USER }}" \
             --extra-vars "image_full=${IMAGE_FULL}" \
             --extra-vars "image_tag=${IMAGE_TAG}" \
             --extra-vars "gcp_region=${GCP_REGION}" \
-            --extra-vars "gcp_sa_key_path=${GOOGLE_APPLICATION_CREDENTIALS}" \
+            --extra-vars "gcp_creds_file=${GCP_CREDS_FILE}" \
             -v
 
       - name: Verify deployment health
@@ -239,8 +286,6 @@ jobs:
   # ============================================================
   # JOB 4 — Notify main branch is ready (main branch only)
   # ============================================================
-  # main does NOT auto-deploy to production.
-  # This job just confirms the image is ready and tells you what to do next.
   notify-main-ready:
     name: Production image ready
     runs-on: ubuntu-latest
@@ -250,11 +295,11 @@ jobs:
     steps:
       - name: Production deploy instructions
         run: |
-          echo "### Production image is ready" >> $GITHUB_STEP_SUMMARY
+          echo "### Production image is ready — deploy manually" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Image: \`${{ needs.build-and-push.outputs.image_full }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**To deploy to Cloud Run (production):**" >> $GITHUB_STEP_SUMMARY
+          echo "**Deploy to Cloud Run:**" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
           echo "gcloud run deploy d2c-platform \\" >> $GITHUB_STEP_SUMMARY
           echo "  --image=${{ needs.build-and-push.outputs.image_full }} \\" >> $GITHUB_STEP_SUMMARY
