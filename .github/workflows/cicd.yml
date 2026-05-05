@@ -257,6 +257,24 @@ jobs:
           chmod 600 "$CREDS_FILE"
           echo "path=${CREDS_FILE}" >> $GITHUB_OUTPUT
 
+      # Authenticate in THIS job so we can get a real access token.
+      # The credentials file from build-and-push cannot be reused on the server
+      # because it calls back to the GitHub OIDC endpoint which is only valid
+      # while that job is running. Once that job completes → "job is already completed".
+      # Solution: authenticate fresh here, get a static OAuth2 access token,
+      # pass it to the server. docker login uses it directly — no gcloud needed.
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get Docker registry access token
+        id: docker_token
+        run: |
+          TOKEN=$(gcloud auth print-access-token)
+          echo "token=${TOKEN}" >> $GITHUB_OUTPUT
+
       # Reconstruct the image name here instead of relying on cross-job outputs.
       # Same formula as build-and-push — deterministic from secrets + git context.
       - name: Compute image name
@@ -294,7 +312,7 @@ jobs:
           IMAGE_FULL: ${{ steps.image.outputs.image_full }}
           IMAGE_TAG: ${{ steps.image.outputs.image_tag }}
           GCP_REGION: ${{ secrets.GCP_REGION }}
-          GCP_CREDS: ${{ steps.creds.outputs.path }}
+          DOCKER_TOKEN: ${{ steps.docker_token.outputs.token }}
         run: |
           echo "Image to deploy: ${IMAGE_FULL}"
           ansible-playbook ansible/deploy.yml \
@@ -302,7 +320,7 @@ jobs:
             --private-key ~/.ssh/uat_deploy_key \
             --user "${{ secrets.UAT_SERVER_USER }}" \
             --vault-password-file /tmp/vault-pass.txt \
-            --extra-vars "{\"image_full\":\"${IMAGE_FULL}\",\"image_tag\":\"${IMAGE_TAG}\",\"gcp_region\":\"${GCP_REGION}\",\"gcp_creds_file\":\"${GCP_CREDS}\"}" \
+            --extra-vars "{\"image_full\":\"${IMAGE_FULL}\",\"image_tag\":\"${IMAGE_TAG}\",\"gcp_region\":\"${GCP_REGION}\",\"docker_token\":\"${DOCKER_TOKEN}\"}" \
             -v
 
       - name: Remove vault password file

@@ -75,6 +75,17 @@
       become: true
 
     # ── 3. Write .env.uat from Ansible Vault variables ────────────────────────
+    # WHY template and not copy:
+    #   The copy module treats content as a raw string — {{ vault_jwt_secret_key }}
+    #   would be written literally, not replaced with the actual value.
+    #   The template module renders Jinja2 expressions before writing the file,
+    #   so vault variables are substituted with their real values.
+    #
+    # WHY no become: true here:
+    #   With become: true, Ansible writes to a root-owned temp file first, then
+    #   moves it. Setting owner: ansible_user triggers a chown that can fail.
+    #   The directory /opt/d2c is already owned by ansible_user (created above),
+    #   so the template module can write directly without sudo.
     - name: Write /opt/d2c/.env.uat from vault template
       template:
         src: templates/env.uat.j2
@@ -120,27 +131,19 @@
       when: postgres_running.rc != 0 or postgres_running.stdout | trim != 'true'
 
     # ── 6. Authenticate Docker to Artifact Registry ───────────────────────────
-    - name: Copy GCP credentials file to server
-      copy:
-        src: "{{ gcp_creds_file }}"
-        dest: "/tmp/gcp-pull-creds.json"
-        mode: "0600"
-
-    - name: Activate GCP credentials
+    # Use the OAuth2 access token obtained in the GitHub Actions runner.
+    # docker login with oauth2accesstoken works directly — no gcloud needed.
+    # The token was obtained WHILE the deploy-uat job was running (fresh WIF auth),
+    # so it is valid. The old approach (copying the WIF credentials file to the
+    # server) failed because that file calls back to GitHub's OIDC endpoint which
+    # is only alive during the build-and-push job — by deploy time it returns
+    # "job is already completed".
+    - name: Login to Artifact Registry
       command: >
-        gcloud auth login
-        --cred-file=/tmp/gcp-pull-creds.json
-        --quiet
-
-    - name: Configure Docker for Artifact Registry
-      command: >
-        gcloud auth configure-docker {{ gcp_region }}-docker.pkg.dev
-        --quiet
-
-    - name: Remove GCP credentials file after Docker login
-      file:
-        path: /tmp/gcp-pull-creds.json
-        state: absent
+        docker login {{ gcp_region }}-docker.pkg.dev
+        -u oauth2accesstoken
+        -p {{ docker_token }}
+      no_log: true
 
     # ── 7. Pull new image ─────────────────────────────────────────────────────
     - name: Pull new image from Artifact Registry
