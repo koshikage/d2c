@@ -161,10 +161,10 @@ class Settings(BaseSettings):
     # DB username for the Cloud SQL app user (password comes from Secret Manager)
     CLOUD_SQL_DB_USER: str = "d2c_app"
     CLOUD_SQL_DB_NAME: str = "d2c_db"
-    LOG_FILE_ENABLED: bool = True
-    LOG_FILE_PATH: str = "/var/log/d2c_app.log"   # Cloud Run writable log path
-    LOG_FILE_MAX_BYTES : int = 10 * 1024 * 1024  # 10 MB
-    LOG_FILE_BACKUP_COUNT: int = 5              # number of rotated log files to
+    LOG_FILE_ENABLED: bool = False
+    LOG_FILE_PATH: str = "logs/app.log"
+    LOG_FILE_MAX_BYTES: int = 10 * 1024 * 1024
+    LOG_FILE_BACKUP_COUNT: int = 5
     # ══════════════════════════════════════════════════════════════════════════
     # SECRETS
     # In development: read from .env file by Pydantic (Phase 1)

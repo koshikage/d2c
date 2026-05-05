@@ -181,52 +181,55 @@ async def load_production_secrets(settings: "Settings") -> None:
 
 def _assemble_cloud_sql_urls(settings: "Settings") -> None:
     """
-    Build the async and sync DATABASE_URLs for Cloud SQL.
+    Build the DATABASE_URL after the DB_PASSWORD secret has been loaded.
 
-    In production, the DB password comes from Secret Manager (now loaded).
-    The hostname is a Unix socket path managed by the Cloud SQL Auth Proxy,
-    not a TCP host:port. This means:
-      - No network port opened (more secure)
-      - IAM authentication handled by the Proxy
-      - No SSL certificate management needed
+    Two cases:
+      Cloud Run + Cloud SQL (CLOUD_SQL_INSTANCE set):
+        Uses the Unix socket path managed by the Cloud SQL Auth Proxy.
+        No TCP port, no SSL — the proxy handles everything.
 
-    Unix socket path format (asyncpg): ?host=/cloudsql/PROJECT:REGION:INSTANCE
-    Unix socket path format (psycopg2): host=/cloudsql/PROJECT:REGION:INSTANCE (in query string)
-
-    If CLOUD_SQL_INSTANCE is not set (e.g. running on a plain VPS, not Cloud Run),
-    the DATABASE_URL is left as-is from the env var.
+      VPS / UAT (CLOUD_SQL_INSTANCE empty):
+        DATABASE_URL was written by Ansible with PENDING as the password
+        placeholder. We replace PENDING with the real password fetched
+        from Secret Manager.
     """
-    if not settings.CLOUD_SQL_INSTANCE:
-        logger.info("cloud_sql_url_skipped", reason="CLOUD_SQL_INSTANCE not set, using DATABASE_URL as-is")
-        return
-
     db_password = settings.DB_PASSWORD.get_secret_value()
-    db_user = settings.CLOUD_SQL_DB_USER
-    db_name = settings.CLOUD_SQL_DB_NAME
-    socket_path = f"/cloudsql/{settings.CLOUD_SQL_INSTANCE}"
 
-    # asyncpg (used by the app at runtime)
-    async_url = (
-        f"postgresql+asyncpg://{db_user}:{db_password}@/{db_name}"
-        f"?host={socket_path}"
-    )
+    if settings.CLOUD_SQL_INSTANCE:
+        # Cloud Run path — Unix socket
+        db_user = settings.CLOUD_SQL_DB_USER
+        db_name = settings.CLOUD_SQL_DB_NAME
+        socket_path = f"/cloudsql/{settings.CLOUD_SQL_INSTANCE}"
 
-    # psycopg2 (used by Alembic for migrations only)
-    sync_url = (
-        f"postgresql+psycopg2://{db_user}:{db_password}@/{db_name}"
-        f"?host={socket_path}"
-    )
+        async_url = (
+            f"postgresql+asyncpg://{db_user}:{db_password}@/{db_name}"
+            f"?host={socket_path}"
+        )
+        sync_url = (
+            f"postgresql+psycopg2://{db_user}:{db_password}@/{db_name}"
+            f"?host={socket_path}"
+        )
+        object.__setattr__(settings, "DATABASE_URL", async_url)
+        object.__setattr__(settings, "DATABASE_SYNC_URL", sync_url)
 
-    object.__setattr__(settings, "DATABASE_URL", async_url)
-    object.__setattr__(settings, "DATABASE_SYNC_URL", sync_url)
+        logger.info(
+            "cloud_sql_url_assembled",
+            instance=settings.CLOUD_SQL_INSTANCE,
+            db_user=db_user,
+            db_name=db_name,
+        )
+    else:
+        # VPS/UAT path — replace the PENDING placeholder with the real password
+        # Ansible wrote: postgresql+asyncpg://d2c:PENDING@d2c-postgres:5432/d2c_db
+        async_url = settings.DATABASE_URL.replace("PENDING", db_password)
+        sync_url = settings.DATABASE_SYNC_URL.replace("PENDING", db_password)
+        object.__setattr__(settings, "DATABASE_URL", async_url)
+        object.__setattr__(settings, "DATABASE_SYNC_URL", sync_url)
 
-    logger.info(
-        "cloud_sql_url_assembled",
-        instance=settings.CLOUD_SQL_INSTANCE,
-        db_user=db_user,
-        db_name=db_name,
-        # Never log the password or the full URL (contains password)
-    )
+        logger.info(
+            "vps_db_url_assembled",
+            reason="CLOUD_SQL_INSTANCE not set — using TCP connection with fetched password",
+        )
 
 
 # ── Utility functions for managing secrets (run these from your terminal) ──────
@@ -257,7 +260,9 @@ def create_secret(project_id: str, secret_name: str, secret_value: str) -> None:
                 "secret": {"replication": {"automatic": {}}},
             }
         )
+        print(f"Created secret: {secret.name}")
     except AlreadyExists:
+        print(f"Secret {secret_name} already exists — adding new version")
 
     # Add the secret value as version 1 (or next version if already exists)
     secret_path = f"projects/{project_id}/secrets/{secret_name}"
