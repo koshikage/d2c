@@ -73,7 +73,7 @@ class TestShopifyHMAC:
         body = b'{"id":"test_order","total_price":"99.99"}'
         signature = base64.b64encode(
             hmac.new(
-                settings.SHOPIFY_WEBHOOK_SECRET.encode(),
+                settings.SHOPIFY_WEBHOOK_SECRET.get_secret_value().encode(),
                 body,
                 hashlib.sha256,
             ).digest()
@@ -94,7 +94,7 @@ class TestShopifyHMAC:
         original_body = b'{"id":"order_1"}'
         signature = base64.b64encode(
             hmac.new(
-                settings.SHOPIFY_WEBHOOK_SECRET.encode(),
+                settings.SHOPIFY_WEBHOOK_SECRET.get_secret_value().encode(),
                 original_body,
                 hashlib.sha256,
             ).digest()
