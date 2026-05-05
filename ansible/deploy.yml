@@ -3,33 +3,27 @@
 # Ansible Deploy Playbook — D2C Platform UAT
 # ============================================================
 #
-# CALLED BY: .github/workflows/cicd.yml → deploy-uat job
-#
 # WHAT THIS DOES (in order):
-#   1. Check Docker is installed and .env.uat exists on server
-#   2. Copy the short-lived GCP credentials file from GitHub Actions runner to server
-#   3. Authenticate Docker on the server to GCP Artifact Registry using that file
-#   4. Remove the credentials file from the server immediately after docker login
-#   5. Pull the new image
-#   6. Run Alembic migrations in a temp container (before app restarts)
-#   7. Stop and remove the old container
-#   8. Start the new container
-#   9. Health check — fail if app reports degraded
-#  10. Prune dangling images to save disk space
+#   1.  Check Docker is installed
+#   2.  Create /opt/d2c and /opt/d2c/logs directories
+#   3.  Fetch all secrets from GCP Secret Manager and write /opt/d2c/.env.uat
+#       (creates it on first deploy, updates it on subsequent deploys)
+#   4.  Create Docker network
+#   5.  Start Postgres container (if not already running)
+#   6.  Copy GCP credentials file → authenticate Docker → delete credentials
+#   7.  Pull new app image from Artifact Registry
+#   8.  Run Alembic migrations (temp container, before app restarts)
+#   9.  Stop and remove old app container
+#   10. Start new app container
+#   11. Health check — fail deploy if app reports degraded
+#   12. Install nginx (if not present) and deploy nginx config
+#   13. Prune dangling images
 #
 # VARIABLES PASSED IN (--extra-vars from cicd.yml):
 #   image_full       full image path with tag
 #   image_tag        short tag for logging
 #   gcp_region       e.g. asia-south2
 #   gcp_creds_file   path to GCP credentials JSON on the GitHub Actions runner
-#                    (short-lived token created by Workload Identity, expires in 1h)
-#
-# NOTE ON AUTHENTICATION:
-#   We do NOT use a long-lived SA JSON key.
-#   The credentials file is created by google-github-actions/auth in cicd.yml
-#   and contains a short-lived OAuth2 token valid for 1 hour.
-#   It is copied to the server, used for docker login, then immediately deleted.
-#   The server never stores persistent credentials.
 
 - name: Deploy D2C Platform to UAT
   hosts: all
@@ -42,10 +36,13 @@
     container_port: 8000
     network_name:   d2c-network
     log_dir:        /opt/d2c/logs
+    db_container:   d2c-postgres
+    db_name:        d2c_db
+    db_user:        d2c
 
   tasks:
 
-    # ── Prerequisite checks ───────────────────────────────────────────────
+    # ── 1. Prerequisites ──────────────────────────────────────────────────────
     - name: Check Docker is installed
       command: docker --version
       register: docker_version
@@ -55,6 +52,7 @@
       debug:
         msg: "{{ docker_version.stdout }}"
 
+    # ── 2. Create directories ─────────────────────────────────────────────────
     - name: Ensure app directories exist
       file:
         path: "{{ item }}"
@@ -66,35 +64,17 @@
         - "{{ log_dir }}"
       become: true
 
-    - name: Check .env.uat exists on server
-      stat:
-        path: "{{ app_dir }}/.env.uat"
-      register: env_file
+    # ── 3. Fetch secrets from GCP Secret Manager → write .env.uat ────────────
+    # This step runs gcloud on the server to fetch each secret, then writes
+    # the complete .env.uat file. This means:
+    #   - First deploy: creates the file automatically (no manual SSH needed)
+    #   - Subsequent deploys: updates it with latest secret versions
+    #   - Secret rotation: just re-deploy and the new values are picked up
+    #
+    # The gcp_creds_file is the short-lived credentials from Workload Identity.
+    # It is already on the server from the "Copy GCP credentials" task below —
+    # but we need it BEFORE that step to fetch secrets. We do the copy early.
 
-    - name: Fail clearly if .env.uat is missing
-      fail:
-        msg: |
-          /opt/d2c/.env.uat not found on the server.
-
-          SSH into the server and create it:
-            sudo nano /opt/d2c/.env.uat
-            sudo chmod 600 /opt/d2c/.env.uat
-
-          Copy content from ansible/.env.uat.template in the repo.
-          Fill in secrets from GCP Secret Manager.
-      when: not env_file.stat.exists
-
-    # ── Docker network ────────────────────────────────────────────────────
-    - name: Create Docker network if it does not exist
-      command: docker network create {{ network_name }}
-      register: network_result
-      failed_when: network_result.rc != 0 and 'already exists' not in network_result.stderr
-      changed_when: network_result.rc == 0
-
-    # ── Authenticate Docker to Artifact Registry ──────────────────────────
-    # We copy the short-lived credentials file from the GitHub Actions runner
-    # to the server, use it for docker login, then delete it immediately.
-    # The file contains a 1-hour OAuth2 token — not a permanent key.
     - name: Copy short-lived GCP credentials to server
       copy:
         src: "{{ gcp_creds_file }}"
@@ -107,16 +87,152 @@
         --key-file=/tmp/gcp-creds.json
         --quiet
 
+    - name: Fetch JWT_SECRET_KEY from Secret Manager
+      command: >
+        gcloud secrets versions access latest
+        --secret=d2c-jwt-secret
+        --quiet
+      register: jwt_secret
+      no_log: true
+
+    - name: Fetch ENCRYPTION_KEY from Secret Manager
+      command: >
+        gcloud secrets versions access latest
+        --secret=d2c-encryption-key
+        --quiet
+      register: encryption_key
+      no_log: true
+
+    - name: Fetch DB_PASSWORD from Secret Manager
+      command: >
+        gcloud secrets versions access latest
+        --secret=d2c-db-password
+        --quiet
+      register: db_password
+      no_log: true
+
+    - name: Fetch SHOPIFY_CLIENT_SECRET from Secret Manager
+      command: >
+        gcloud secrets versions access latest
+        --secret=d2c-shopify-client-secret
+        --quiet
+      register: shopify_client_secret
+      no_log: true
+
+    - name: Fetch SHOPIFY_WEBHOOK_SECRET from Secret Manager
+      command: >
+        gcloud secrets versions access latest
+        --secret=d2c-shopify-webhook-secret
+        --quiet
+      register: shopify_webhook_secret
+      no_log: true
+
+    - name: Fetch META_APP_SECRET from Secret Manager
+      command: >
+        gcloud secrets versions access latest
+        --secret=d2c-meta-app-secret
+        --quiet
+      register: meta_app_secret
+      no_log: true
+
+    - name: Write /opt/d2c/.env.uat from fetched secrets
+      copy:
+        dest: "{{ app_dir }}/.env.uat"
+        mode: "0600"
+        owner: "{{ ansible_user }}"
+        content: |
+          # Auto-generated by Ansible deploy playbook
+          # Do not edit manually — changes will be overwritten on next deploy
+          # To change a value: update the secret in GCP Secret Manager and redeploy
+
+          ENVIRONMENT=production
+          DEBUG=false
+          LOG_LEVEL=INFO
+          LOG_FORMAT=json
+          LOG_FILE_ENABLED=true
+          LOG_FILE_PATH=logs/app.log
+          LOG_FILE_MAX_BYTES=10485760
+          LOG_FILE_BACKUP_COUNT=5
+
+          DATABASE_URL=postgresql+asyncpg://{{ db_user }}:{{ db_password.stdout }}@{{ db_container }}:5432/{{ db_name }}
+          DATABASE_SYNC_URL=postgresql+psycopg2://{{ db_user }}:{{ db_password.stdout }}@{{ db_container }}:5432/{{ db_name }}
+          DB_POOL_SIZE=10
+          DB_MAX_OVERFLOW=20
+          DB_PASSWORD={{ db_password.stdout }}
+
+          JWT_SECRET_KEY={{ jwt_secret.stdout }}
+          JWT_ALGORITHM=HS256
+          JWT_ACCESS_TOKEN_EXPIRE_MINUTES=60
+
+          ENCRYPTION_KEY={{ encryption_key.stdout }}
+
+          SHOPIFY_CLIENT_ID=mock_shopify_client_id
+          SHOPIFY_CLIENT_SECRET={{ shopify_client_secret.stdout }}
+          SHOPIFY_WEBHOOK_SECRET={{ shopify_webhook_secret.stdout }}
+          SHOPIFY_MOCK_BASE_URL=http://mock-shopify:8001
+
+          META_APP_ID=mock_meta_app_id
+          META_APP_SECRET={{ meta_app_secret.stdout }}
+          META_MOCK_BASE_URL=http://mock-meta:8002
+
+          ALLOWED_ORIGINS=["http://{{ ansible_host }}","http://{{ ansible_host }}:8000"]
+
+          GCP_PROJECT_ID=
+          CLOUD_SQL_INSTANCE=
+      become: true
+      no_log: true
+
+    # ── 4. Docker network ─────────────────────────────────────────────────────
+    - name: Create Docker network if it does not exist
+      command: docker network create {{ network_name }}
+      register: network_result
+      failed_when: network_result.rc != 0 and 'already exists' not in network_result.stderr
+      changed_when: network_result.rc == 0
+
+    # ── 5. Postgres container ─────────────────────────────────────────────────
+    - name: Check if Postgres container is running
+      command: docker inspect -f "{{ '{{' }}.State.Running{{ '}}' }}" {{ db_container }}
+      register: postgres_running
+      failed_when: false
+      changed_when: false
+
+    - name: Start Postgres container if not running
+      command: >
+        docker run
+        --detach
+        --name {{ db_container }}
+        --restart unless-stopped
+        --network {{ network_name }}
+        --volume postgres_data:/var/lib/postgresql/data
+        --env POSTGRES_USER={{ db_user }}
+        --env POSTGRES_PASSWORD={{ db_password.stdout }}
+        --env POSTGRES_DB={{ db_name }}
+        postgres:16-alpine
+      when: postgres_running.rc != 0 or postgres_running.stdout != 'true'
+      no_log: true
+
+    - name: Wait for Postgres to be ready
+      command: >
+        docker exec {{ db_container }}
+        pg_isready -U {{ db_user }} -d {{ db_name }}
+      register: pg_ready
+      retries: 12
+      delay: 5
+      until: pg_ready.rc == 0
+      when: postgres_running.rc != 0 or postgres_running.stdout != 'true'
+
+    # ── 6. Authenticate Docker to Artifact Registry ───────────────────────────
+    # Credentials file is already on the server from step 3.
     - name: Configure Docker to use Artifact Registry
       command: >
         gcloud auth configure-docker {{ gcp_region }}-docker.pkg.dev --quiet
 
-    - name: Remove credentials file from server immediately
+    - name: Remove credentials file from server
       file:
         path: /tmp/gcp-creds.json
         state: absent
 
-    # ── Pull new image ────────────────────────────────────────────────────
+    # ── 7. Pull new image ─────────────────────────────────────────────────────
     - name: Pull new image from Artifact Registry
       command: docker pull {{ image_full }}
       register: pull_result
@@ -125,9 +241,9 @@
       debug:
         msg: "{{ pull_result.stdout_lines[-3:] }}"
 
-    # ── Run Alembic migrations ────────────────────────────────────────────
+    # ── 8. Run Alembic migrations ─────────────────────────────────────────────
     # Runs BEFORE the app restarts. If migrations fail, the old container
-    # keeps running and deploy stops here — no broken deployment.
+    # keeps running — no broken deployment.
     - name: Run Alembic migrations
       command: >
         docker run --rm
@@ -147,7 +263,7 @@
         msg: "Migration failed — old container is still running.\n{{ migration_result.stderr }}"
       when: migration_result.rc != 0
 
-    # ── Stop and remove old container ─────────────────────────────────────
+    # ── 9. Stop and remove old container ─────────────────────────────────────
     - name: Stop old container
       command: docker stop {{ container_name }}
       register: stop_result
@@ -160,15 +276,15 @@
       failed_when: rm_result.rc != 0 and 'No such container' not in rm_result.stderr
       changed_when: rm_result.rc == 0
 
-    # ── Start new container ───────────────────────────────────────────────
-    - name: Start new container
+    # ── 10. Start new container ───────────────────────────────────────────────
+    - name: Start new app container
       command: >
         docker run
         --detach
         --name {{ container_name }}
         --restart unless-stopped
         --network {{ network_name }}
-        --publish {{ container_port }}:8000
+        --publish 127.0.0.1:{{ container_port }}:8000
         --env-file {{ app_dir }}/.env.uat
         --volume {{ log_dir }}:/app/logs
         --log-driver json-file
@@ -181,9 +297,9 @@
 
     - name: Show new container ID
       debug:
-        msg: "Started container: {{ run_result.stdout[:12] }}"
+        msg: "Started: {{ run_result.stdout[:12] }}"
 
-    # ── Health check ─────────────────────────────────────────────────────
+    # ── 11. Health check ──────────────────────────────────────────────────────
     - name: Wait for app to pass health check
       uri:
         url: "http://localhost:{{ container_port }}/health"
@@ -195,16 +311,55 @@
       delay: 5
       until: health.status == 200
 
-    - name: Show health response
-      debug:
-        msg: "Health: {{ health.json }}"
-
     - name: Fail if app is degraded
       fail:
         msg: "Container started but DB is unhealthy: {{ health.json }}"
       when: health.json.status == 'degraded'
 
-    # ── Prune old images ──────────────────────────────────────────────────
+    # ── 12. Nginx setup ───────────────────────────────────────────────────────
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present
+        update_cache: yes
+      become: true
+
+    - name: Copy nginx config
+      copy:
+        src: ../infra/nginx/d2c-platform.nginx.conf
+        dest: /etc/nginx/sites-available/d2c-platform
+        mode: "0644"
+      become: true
+      notify: reload nginx
+
+    - name: Enable nginx site
+      file:
+        src: /etc/nginx/sites-available/d2c-platform
+        dest: /etc/nginx/sites-enabled/d2c-platform
+        state: link
+      become: true
+      notify: reload nginx
+
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      become: true
+      notify: reload nginx
+
+    - name: Validate nginx config
+      command: nginx -t
+      become: true
+      changed_when: false
+
+    - name: Ensure nginx is running
+      systemd:
+        name: nginx
+        state: started
+        enabled: yes
+      become: true
+
+    # ── 13. Prune old images ──────────────────────────────────────────────────
     - name: Remove dangling images
       command: docker image prune -f
       register: prune_result
@@ -217,3 +372,12 @@
           Image : {{ image_tag }}
           Health: {{ health.json.status }}
           DB    : {{ health.json.db }}
+          URL   : http://{{ ansible_host }}
+
+  # ── Handlers ─────────────────────────────────────────────────────────────────
+  handlers:
+    - name: reload nginx
+      systemd:
+        name: nginx
+        state: reloaded
+      become: true
