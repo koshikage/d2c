@@ -74,13 +74,13 @@
         - "{{ log_dir }}"
       become: true
 
-
+    # ── 3. Write .env.uat from Ansible Vault variables ────────────────────────
     - name: Write /opt/d2c/.env.uat from vault template
       template:
         src: templates/env.uat.j2
         dest: "{{ app_dir }}/.env.uat"
         mode: "0600"
-      no_log: true
+      no_log: false
 
     # ── 4. Docker network ─────────────────────────────────────────────────────
     - name: Create Docker network if it does not exist
