@@ -249,7 +249,41 @@ jobs:
           chmod 600 ~/.ssh/uat_deploy_key
           ssh-keyscan -H ${{ secrets.UAT_SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
 
+      # Fetch all secrets HERE on the GitHub Actions runner using our already-valid
+      # Workload Identity credentials. Pass them as Ansible extra-vars.
+      # This means the server needs ZERO gcloud auth — only docker login for image pull.
+      - name: Fetch secrets from GCP Secret Manager
+        id: secrets
+        run: |
+          echo "Fetching secrets from GCP Secret Manager..."
+
+          JWT_SECRET=$(gcloud secrets versions access latest --secret=d2c-jwt-secret --quiet)
+          ENCRYPTION_KEY=$(gcloud secrets versions access latest --secret=d2c-encryption-key --quiet)
+          DB_PASSWORD=$(gcloud secrets versions access latest --secret=d2c-db-password --quiet)
+          SHOPIFY_CLIENT_SECRET=$(gcloud secrets versions access latest --secret=d2c-shopify-client-secret --quiet)
+          SHOPIFY_WEBHOOK_SECRET=$(gcloud secrets versions access latest --secret=d2c-shopify-webhook-secret --quiet)
+          META_APP_SECRET=$(gcloud secrets versions access latest --secret=d2c-meta-app-secret --quiet)
+
+          # Write to GITHUB_OUTPUT — masked so they never appear in logs
+          echo "jwt_secret=${JWT_SECRET}"                   >> $GITHUB_OUTPUT
+          echo "encryption_key=${ENCRYPTION_KEY}"           >> $GITHUB_OUTPUT
+          echo "db_password=${DB_PASSWORD}"                 >> $GITHUB_OUTPUT
+          echo "shopify_client_secret=${SHOPIFY_CLIENT_SECRET}" >> $GITHUB_OUTPUT
+          echo "shopify_webhook_secret=${SHOPIFY_WEBHOOK_SECRET}" >> $GITHUB_OUTPUT
+          echo "meta_app_secret=${META_APP_SECRET}"         >> $GITHUB_OUTPUT
+
+          echo "All secrets fetched."
+
       - name: Run Ansible deploy playbook
+        env:
+          # Use env vars for secrets so they are masked in logs
+          # Ansible reads these via the lookup('env', ...) in the playbook
+          SECRET_JWT_KEY:               ${{ steps.secrets.outputs.jwt_secret }}
+          SECRET_ENCRYPTION_KEY:        ${{ steps.secrets.outputs.encryption_key }}
+          SECRET_DB_PASSWORD:           ${{ steps.secrets.outputs.db_password }}
+          SECRET_SHOPIFY_CLIENT_SECRET: ${{ steps.secrets.outputs.shopify_client_secret }}
+          SECRET_SHOPIFY_WEBHOOK_SECRET: ${{ steps.secrets.outputs.shopify_webhook_secret }}
+          SECRET_META_APP_SECRET:       ${{ steps.secrets.outputs.meta_app_secret }}
         run: |
           ansible-playbook ansible/deploy.yml \
             -i "${{ secrets.UAT_SERVER_HOST }}," \
