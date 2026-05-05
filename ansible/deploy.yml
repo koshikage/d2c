@@ -64,6 +64,7 @@
       loop:
         - "{{ app_dir }}"
         - "{{ log_dir }}"
+      become: true
 
     - name: Check .env.uat exists on server
       stat:
