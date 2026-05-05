@@ -1,0 +1,262 @@
+# ============================================================
+# CI/CD Pipeline — D2C Platform
+# ============================================================
+#
+# BRANCH STRATEGY:
+#
+#   uat  → build image → push to Artifact Registry → pull & run on UAT server
+#   main → build image → push to Artifact Registry → STOP (no auto-deploy)
+#
+# WHY main does NOT auto-deploy:
+#   Production deploys are intentional. After this workflow pushes the image,
+#   a human runs the Cloud Run deploy step (or triggers it via a separate
+#   manual-approval workflow). This prevents an accidental push to main from
+#   taking down production.
+#
+# ============================================================
+# SECRETS REQUIRED IN GITHUB (Settings → Secrets → Actions):
+#
+#   GCP_WORKLOAD_IDENTITY_PROVIDER   full provider resource name
+#   GCP_SERVICE_ACCOUNT              service account email
+#   GCP_REGION                       e.g. asia-south2
+#
+#   UAT_SERVER_HOST         IP or hostname of the UAT server     (add later)
+#   UAT_SERVER_USER         SSH user on the UAT server           (add later)
+#   UAT_SSH_PRIVATE_KEY     SSH private key for the UAT server   (add later)
+#
+# ============================================================
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - uat
+      - main
+  pull_request:
+    branches:
+      - uat
+      - main
+
+env:
+  REGION: ${{ secrets.GCP_REGION }}
+  # PROJECT_ID is extracted from GCP_SERVICE_ACCOUNT in the compute-tags step
+  # Format: d2c-cicd-sa@YOUR-PROJECT-ID.iam.gserviceaccount.com
+  # So we do NOT need a separate GCP_PROJECT_ID secret.
+  REGISTRY: ${{ secrets.GCP_REGION }}-docker.pkg.dev
+
+jobs:
+
+  # ============================================================
+  # JOB 1 — Tests (runs on every push and PR)
+  # ============================================================
+  test:
+    name: Run unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        env:
+          ENVIRONMENT: test
+          # Fixed test secrets — not real values, safe in CI logs
+          JWT_SECRET_KEY: test_jwt_secret_for_ci_not_production
+          ENCRYPTION_KEY: dGVzdF9lbmNyeXB0aW9uX2tleV9mb3JfdGVzdHM=
+          SHOPIFY_WEBHOOK_SECRET: test_webhook_secret
+        run: |
+          pytest tests/unit/ -v --tb=short
+
+  # ============================================================
+  # JOB 2 — Build & Push image (uat and main branches only)
+  # ============================================================
+  build-and-push:
+    name: Build and push Docker image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main')
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_full: ${{ steps.meta.outputs.image_full }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Extract project ID from service account email ────────────
+      # GCP_SERVICE_ACCOUNT = d2c-cicd-sa@YOUR-PROJECT-ID.iam.gserviceaccount.com
+      # We extract YOUR-PROJECT-ID from it — no separate GCP_PROJECT_ID secret needed.
+      - name: Compute image tags
+        id: meta
+        run: |
+          SA="${{ secrets.GCP_SERVICE_ACCOUNT }}"
+          PROJECT_ID=$(echo "$SA" | sed 's/.*@//' | sed 's/\.iam\.gserviceaccount\.com//')
+          IMAGE_PATH="${{ env.REGISTRY }}/${PROJECT_ID}/d2c/app"
+
+          SHA="${{ github.sha }}"
+          SHORT_SHA="${SHA:0:8}"
+          BRANCH="${{ github.ref_name }}"
+          IMAGE_TAG="${BRANCH}-${SHORT_SHA}"
+          IMAGE_FULL="${IMAGE_PATH}:${IMAGE_TAG}"
+
+          echo "project_id=${PROJECT_ID}"   >> $GITHUB_OUTPUT
+          echo "image_path=${IMAGE_PATH}"   >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}"     >> $GITHUB_OUTPUT
+          echo "image_full=${IMAGE_FULL}"   >> $GITHUB_OUTPUT
+          echo "branch=${BRANCH}"           >> $GITHUB_OUTPUT
+
+          echo "Project ID : ${PROJECT_ID}"
+          echo "Image      : ${IMAGE_FULL}"
+
+      # ── Authenticate to GCP via Workload Identity ─────────────
+      # No JSON key file needed. GitHub gets a short-lived OIDC token
+      # (expires in 1 hour). Works even when SA key creation is blocked.
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGISTRY }} --quiet
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -f infra/Dockerfile \
+            -t ${{ steps.meta.outputs.image_full }} \
+            -t ${{ steps.meta.outputs.image_path }}:${{ steps.meta.outputs.branch }}-latest \
+            --label "git.sha=${{ github.sha }}" \
+            --label "git.branch=${{ github.ref_name }}" \
+            --label "built.by=github-actions" \
+            --label "built.at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            .
+
+      - name: Push Docker image
+        run: |
+          docker push ${{ steps.meta.outputs.image_full }}
+          docker push ${{ steps.meta.outputs.image_path }}:${{ steps.meta.outputs.branch }}-latest
+
+      - name: Summary
+        run: |
+          echo "### Image pushed" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Tag** | \`${{ steps.meta.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Full image** | \`${{ steps.meta.outputs.image_full }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================
+  # JOB 3 — Deploy to UAT server (DISABLED — add server secrets to enable)
+  # ============================================================
+  # To enable this job:
+  #   1. Add these secrets to GitHub:
+  #        UAT_SERVER_HOST       your server IP
+  #        UAT_SERVER_USER       e.g. ubuntu
+  #        UAT_SSH_PRIVATE_KEY   your SSH private key
+  #   2. Change   if: false   to   if: github.ref == 'refs/heads/uat'
+  deploy-uat:
+    name: Deploy to UAT server
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: false   # <-- change to: github.ref == 'refs/heads/uat'  when you have server secrets
+    environment: uat
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python for Ansible
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Ansible
+        run: pip install ansible==9.5.1
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.UAT_SSH_PRIVATE_KEY }}" > ~/.ssh/uat_deploy_key
+          chmod 600 ~/.ssh/uat_deploy_key
+          ssh-keyscan -H ${{ secrets.UAT_SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      # Workload Identity creates a credentials file automatically.
+      # We pass its path to Ansible so Docker on the server can authenticate.
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Run Ansible deploy playbook
+        env:
+          IMAGE_FULL: ${{ needs.build-and-push.outputs.image_full }}
+          IMAGE_TAG:  ${{ needs.build-and-push.outputs.image_tag }}
+          GCP_REGION: ${{ secrets.GCP_REGION }}
+        run: |
+          ansible-playbook ansible/deploy.yml \
+            -i "${{ secrets.UAT_SERVER_HOST }}," \
+            --private-key ~/.ssh/uat_deploy_key \
+            --user ${{ secrets.UAT_SERVER_USER }} \
+            --extra-vars "image_full=${IMAGE_FULL}" \
+            --extra-vars "image_tag=${IMAGE_TAG}" \
+            --extra-vars "gcp_region=${GCP_REGION}" \
+            --extra-vars "gcp_sa_key_path=${GOOGLE_APPLICATION_CREDENTIALS}" \
+            -v
+
+      - name: Verify deployment health
+        run: |
+          echo "Waiting 15s for container to start..."
+          sleep 15
+          ssh -i ~/.ssh/uat_deploy_key \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.UAT_SERVER_USER }}@${{ secrets.UAT_SERVER_HOST }} \
+              "curl -sf http://localhost:8000/health | python3 -m json.tool"
+
+      - name: Deployment summary
+        run: |
+          echo "### UAT Deploy Complete" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Server** | \`${{ secrets.UAT_SERVER_HOST }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image**  | \`${{ needs.build-and-push.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================
+  # JOB 4 — Notify main branch is ready (main branch only)
+  # ============================================================
+  # main does NOT auto-deploy to production.
+  # This job just confirms the image is ready and tells you what to do next.
+  notify-main-ready:
+    name: Production image ready
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Production deploy instructions
+        run: |
+          echo "### Production image is ready" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Image: \`${{ needs.build-and-push.outputs.image_full }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**To deploy to Cloud Run (production):**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "gcloud run deploy d2c-platform \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --image=${{ needs.build-and-push.outputs.image_full }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --region=${{ secrets.GCP_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

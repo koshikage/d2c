@@ -1,0 +1,218 @@
+---
+# ============================================================
+# Ansible Deploy Playbook — D2C Platform UAT
+# ============================================================
+#
+# CALLED BY: .github/workflows/cicd.yml → deploy-uat job
+#
+# WHAT THIS DOES (in order):
+#   1. Check Docker is installed and .env.uat exists on server
+#   2. Copy the short-lived GCP credentials file from GitHub Actions runner to server
+#   3. Authenticate Docker on the server to GCP Artifact Registry using that file
+#   4. Remove the credentials file from the server immediately after docker login
+#   5. Pull the new image
+#   6. Run Alembic migrations in a temp container (before app restarts)
+#   7. Stop and remove the old container
+#   8. Start the new container
+#   9. Health check — fail if app reports degraded
+#  10. Prune dangling images to save disk space
+#
+# VARIABLES PASSED IN (--extra-vars from cicd.yml):
+#   image_full       full image path with tag
+#   image_tag        short tag for logging
+#   gcp_region       e.g. asia-south2
+#   gcp_creds_file   path to GCP credentials JSON on the GitHub Actions runner
+#                    (short-lived token created by Workload Identity, expires in 1h)
+#
+# NOTE ON AUTHENTICATION:
+#   We do NOT use a long-lived SA JSON key.
+#   The credentials file is created by google-github-actions/auth in cicd.yml
+#   and contains a short-lived OAuth2 token valid for 1 hour.
+#   It is copied to the server, used for docker login, then immediately deleted.
+#   The server never stores persistent credentials.
+
+- name: Deploy D2C Platform to UAT
+  hosts: all
+  become: false
+  gather_facts: true
+
+  vars:
+    app_dir:        /opt/d2c
+    container_name: d2c-app
+    container_port: 8000
+    network_name:   d2c-network
+    log_dir:        /opt/d2c/logs
+
+  tasks:
+
+    # ── Prerequisite checks ───────────────────────────────────────────────
+    - name: Check Docker is installed
+      command: docker --version
+      register: docker_version
+      changed_when: false
+
+    - name: Show Docker version
+      debug:
+        msg: "{{ docker_version.stdout }}"
+
+    - name: Ensure app directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        mode: "0755"
+      loop:
+        - "{{ app_dir }}"
+        - "{{ log_dir }}"
+
+    - name: Check .env.uat exists on server
+      stat:
+        path: "{{ app_dir }}/.env.uat"
+      register: env_file
+
+    - name: Fail clearly if .env.uat is missing
+      fail:
+        msg: |
+          /opt/d2c/.env.uat not found on the server.
+
+          SSH into the server and create it:
+            sudo nano /opt/d2c/.env.uat
+            sudo chmod 600 /opt/d2c/.env.uat
+
+          Copy content from ansible/.env.uat.template in the repo.
+          Fill in secrets from GCP Secret Manager.
+      when: not env_file.stat.exists
+
+    # ── Docker network ────────────────────────────────────────────────────
+    - name: Create Docker network if it does not exist
+      command: docker network create {{ network_name }}
+      register: network_result
+      failed_when: network_result.rc != 0 and 'already exists' not in network_result.stderr
+      changed_when: network_result.rc == 0
+
+    # ── Authenticate Docker to Artifact Registry ──────────────────────────
+    # We copy the short-lived credentials file from the GitHub Actions runner
+    # to the server, use it for docker login, then delete it immediately.
+    # The file contains a 1-hour OAuth2 token — not a permanent key.
+    - name: Copy short-lived GCP credentials to server
+      copy:
+        src: "{{ gcp_creds_file }}"
+        dest: "/tmp/gcp-creds.json"
+        mode: "0600"
+
+    - name: Activate GCP credentials on server
+      command: >
+        gcloud auth activate-service-account
+        --key-file=/tmp/gcp-creds.json
+        --quiet
+
+    - name: Configure Docker to use Artifact Registry
+      command: >
+        gcloud auth configure-docker {{ gcp_region }}-docker.pkg.dev --quiet
+
+    - name: Remove credentials file from server immediately
+      file:
+        path: /tmp/gcp-creds.json
+        state: absent
+
+    # ── Pull new image ────────────────────────────────────────────────────
+    - name: Pull new image from Artifact Registry
+      command: docker pull {{ image_full }}
+      register: pull_result
+
+    - name: Show pull result
+      debug:
+        msg: "{{ pull_result.stdout_lines[-3:] }}"
+
+    # ── Run Alembic migrations ────────────────────────────────────────────
+    # Runs BEFORE the app restarts. If migrations fail, the old container
+    # keeps running and deploy stops here — no broken deployment.
+    - name: Run Alembic migrations
+      command: >
+        docker run --rm
+        --name d2c-migrate-{{ ansible_date_time.epoch }}
+        --network {{ network_name }}
+        --env-file {{ app_dir }}/.env.uat
+        {{ image_full }}
+        alembic upgrade head
+      register: migration_result
+
+    - name: Show migration output
+      debug:
+        msg: "{{ migration_result.stdout_lines }}"
+
+    - name: Fail deploy if migrations failed
+      fail:
+        msg: "Migration failed — old container is still running.\n{{ migration_result.stderr }}"
+      when: migration_result.rc != 0
+
+    # ── Stop and remove old container ─────────────────────────────────────
+    - name: Stop old container
+      command: docker stop {{ container_name }}
+      register: stop_result
+      failed_when: stop_result.rc != 0 and 'No such container' not in stop_result.stderr
+      changed_when: stop_result.rc == 0
+
+    - name: Remove old container
+      command: docker rm {{ container_name }}
+      register: rm_result
+      failed_when: rm_result.rc != 0 and 'No such container' not in rm_result.stderr
+      changed_when: rm_result.rc == 0
+
+    # ── Start new container ───────────────────────────────────────────────
+    - name: Start new container
+      command: >
+        docker run
+        --detach
+        --name {{ container_name }}
+        --restart unless-stopped
+        --network {{ network_name }}
+        --publish {{ container_port }}:8000
+        --env-file {{ app_dir }}/.env.uat
+        --volume {{ log_dir }}:/app/logs
+        --log-driver json-file
+        --log-opt max-size=50m
+        --log-opt max-file=5
+        --label "deploy.image={{ image_tag }}"
+        --label "deploy.time={{ ansible_date_time.iso8601 }}"
+        {{ image_full }}
+      register: run_result
+
+    - name: Show new container ID
+      debug:
+        msg: "Started container: {{ run_result.stdout[:12] }}"
+
+    # ── Health check ─────────────────────────────────────────────────────
+    - name: Wait for app to pass health check
+      uri:
+        url: "http://localhost:{{ container_port }}/health"
+        method: GET
+        status_code: 200
+        return_content: yes
+      register: health
+      retries: 10
+      delay: 5
+      until: health.status == 200
+
+    - name: Show health response
+      debug:
+        msg: "Health: {{ health.json }}"
+
+    - name: Fail if app is degraded
+      fail:
+        msg: "Container started but DB is unhealthy: {{ health.json }}"
+      when: health.json.status == 'degraded'
+
+    # ── Prune old images ──────────────────────────────────────────────────
+    - name: Remove dangling images
+      command: docker image prune -f
+      register: prune_result
+      changed_when: "'Total reclaimed space: 0B' not in prune_result.stdout"
+
+    - name: Deploy complete
+      debug:
+        msg: >
+          Deploy complete.
+          Image : {{ image_tag }}
+          Health: {{ health.json.status }}
+          DB    : {{ health.json.db }}
