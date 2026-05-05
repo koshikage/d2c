@@ -276,17 +276,16 @@ jobs:
         env:
           IMAGE_FULL: ${{ needs.build-and-push.outputs.image_full }}
           IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          GCP_REGION: ${{ secrets.GCP_REGION }}
+          GCP_CREDS: ${{ steps.creds.outputs.path }}
         run: |
-          echo "Deploying image: ${IMAGE_FULL}"
+          echo "Image to deploy: ${IMAGE_FULL}"
           ansible-playbook ansible/deploy.yml \
             -i "${{ secrets.UAT_SERVER_HOST }}," \
             --private-key ~/.ssh/uat_deploy_key \
             --user "${{ secrets.UAT_SERVER_USER }}" \
             --vault-password-file /tmp/vault-pass.txt \
-            --extra-vars "image_full=${IMAGE_FULL}" \
-            --extra-vars "image_tag=${IMAGE_TAG}" \
-            --extra-vars "gcp_region=${{ secrets.GCP_REGION }}" \
-            --extra-vars "gcp_creds_file=${{ steps.creds.outputs.path }}" \
+            --extra-vars "{\"image_full\":\"${IMAGE_FULL}\",\"image_tag\":\"${IMAGE_TAG}\",\"gcp_region\":\"${GCP_REGION}\",\"gcp_creds_file\":\"${GCP_CREDS}\"}" \
             -v
 
       - name: Remove vault password file
