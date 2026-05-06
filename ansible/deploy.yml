@@ -215,7 +215,58 @@
       debug:
         msg: "Started: {{ run_result.stdout[:12] }}"
 
-    # ── 11. Health check ──────────────────────────────────────────────────────
+    # ── 11. Start mock servers ────────────────────────────────────────────────
+    # Mock servers run from the same app image using a different start command.
+    # They live on the d2c-network so the app can reach them as:
+    #   http://mock-shopify:8001
+    #   http://mock-meta:8002
+    - name: Stop old mock-shopify container
+      command: docker stop mock-shopify
+      register: r
+      failed_when: r.rc != 0 and 'No such container' not in r.stderr
+      changed_when: r.rc == 0
+
+    - name: Remove old mock-shopify container
+      command: docker rm mock-shopify
+      register: r
+      failed_when: r.rc != 0 and 'No such container' not in r.stderr
+      changed_when: r.rc == 0
+
+    - name: Start mock-shopify
+      command: >
+        docker run
+        --detach
+        --name mock-shopify
+        --restart unless-stopped
+        --network {{ network_name }}
+        --publish 127.0.0.1:8001:8001
+        {{ image_full }}
+        uvicorn mock_servers.shopify_mock:mock_shopify --host 0.0.0.0 --port 8001
+
+    - name: Stop old mock-meta container
+      command: docker stop mock-meta
+      register: r
+      failed_when: r.rc != 0 and 'No such container' not in r.stderr
+      changed_when: r.rc == 0
+
+    - name: Remove old mock-meta container
+      command: docker rm mock-meta
+      register: r
+      failed_when: r.rc != 0 and 'No such container' not in r.stderr
+      changed_when: r.rc == 0
+
+    - name: Start mock-meta
+      command: >
+        docker run
+        --detach
+        --name mock-meta
+        --restart unless-stopped
+        --network {{ network_name }}
+        --publish 127.0.0.1:8002:8002
+        {{ image_full }}
+        uvicorn mock_servers.meta_mock:mock_meta --host 0.0.0.0 --port 8002
+
+    # ── 12. Health check ──────────────────────────────────────────────────────
     - name: Wait for app to pass health check
       uri:
         url: "http://localhost:{{ container_port }}/health"
