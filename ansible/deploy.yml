@@ -130,13 +130,21 @@
       until: pg_ready.rc == 0
       when: postgres_running.rc != 0 or postgres_running.stdout | trim != 'true'
 
-
-    - name: Login to Artifact Registry with access token
-      command: >
-        docker login {{ gcp_region }}-docker.pkg.dev
-        -u oauth2accesstoken
-        -p {{ docker_token }}
-      no_log: false
+    # ── 6. Authenticate Docker to Artifact Registry ───────────────────────────
+    - name: Write Docker credentials directly
+      shell: |
+        mkdir -p ~/.docker
+        AUTH=$(echo -n "oauth2accesstoken:{{ docker_token }}" | base64 -w 0)
+        cat > ~/.docker/config.json << EOF
+        {
+          "auths": {
+            "{{ gcp_region }}-docker.pkg.dev": {
+              "auth": "${AUTH}"
+            }
+          }
+        }
+        EOF
+      no_log: true
 
     # ── 7. Pull new image ─────────────────────────────────────────────────────
     - name: Pull new image from Artifact Registry
