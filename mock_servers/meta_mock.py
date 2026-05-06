@@ -35,7 +35,7 @@ ROAS CALCULATION:
 import random
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 mock_meta = FastAPI(title="Mock Meta Ads API", version="1.0.0")
@@ -49,11 +49,24 @@ CAMPAIGN_NAMES = [
 ]
 
 
-def _generate_insights(ad_account_id: str, date_preset: str, after_cursor: str | None) -> dict:
+def _mock_base_url(request: Request) -> str:
+    """
+    Return this mock server's own base URL from the incoming request.
+    Used in paging.next so the sync client follows pagination back to
+    THIS server, not to graph.facebook.com.
+    """
+    return str(request.base_url).rstrip("/")
+
+
+def _generate_insights(
+    ad_account_id: str,
+    date_preset: str,
+    after_cursor: str | None,
+    base_url: str,
+) -> dict:
     """Generate realistic-looking Meta campaign insights."""
     random.seed(ad_account_id + (after_cursor or ""))
 
-    num_campaigns = 5
     start_date = datetime.now(timezone.utc) - timedelta(days=30)
 
     data = []
@@ -78,10 +91,9 @@ def _generate_insights(ad_account_id: str, date_preset: str, after_cursor: str |
                 "actions": [
                     {"action_type": "purchase", "value": str(int(clicks * 0.03))}
                 ],
-                "__revenue": revenue,  # convenience field for our normaliser
+                "__revenue": revenue,
             })
 
-    # Paginate: return first 20 items, provide next cursor if more
     page_size = 20
     start = 0
     if after_cursor:
@@ -92,17 +104,22 @@ def _generate_insights(ad_account_id: str, date_preset: str, after_cursor: str |
 
     page_data = data[start: start + page_size]
     has_next = start + page_size < len(data)
+    next_cursor = str(start + page_size)
 
     paging: dict = {
         "cursors": {
             "before": str(max(0, start - page_size)),
-            "after": str(start + page_size),
+            "after": next_cursor,
         }
     }
+
     if has_next:
+        # KEY FIX: use THIS server's base URL, not graph.facebook.com
+        # The sync client follows paging.next verbatim — if it pointed to
+        # the real Meta API, page 2+ would fail with auth errors.
         paging["next"] = (
-            f"https://graph.facebook.com/v19.0/{ad_account_id}/insights"
-            f"?after={start + page_size}"
+            f"{base_url}/v19.0/{ad_account_id}/insights"
+            f"?after={next_cursor}"
         )
 
     return {"data": page_data, "paging": paging}
@@ -110,6 +127,7 @@ def _generate_insights(ad_account_id: str, date_preset: str, after_cursor: str |
 
 @mock_meta.get("/v19.0/{ad_account_id}/insights")
 async def get_insights(
+    request: Request,
     ad_account_id: str,
     date_preset: str = Query(default="last_30d"),
     fields: str = Query(default="campaign_id,campaign_name,spend,impressions,clicks"),
@@ -120,6 +138,10 @@ async def get_insights(
     """
     Simulate Meta Ads Insights API.
     Returns paginated campaign-level spend/ROAS data.
+
+    KEY FIX — paging.next uses the mock server's own base URL:
+      Before: https://graph.facebook.com/v19.0/... → sync follows to real Meta API
+      After:  http://mock-meta:8002/v19.0/...      → sync follows back to this mock
     """
     if not access_token:
         return JSONResponse(
@@ -127,7 +149,10 @@ async def get_insights(
             content={"error": {"message": "Invalid OAuth access token", "code": 190}},
         )
 
-    return JSONResponse(content=_generate_insights(ad_account_id, date_preset, after))
+    base_url = _mock_base_url(request)
+    return JSONResponse(
+        content=_generate_insights(ad_account_id, date_preset, after, base_url)
+    )
 
 
 @mock_meta.get("/v19.0/me")
