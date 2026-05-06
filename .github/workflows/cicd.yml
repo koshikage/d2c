@@ -180,21 +180,6 @@ jobs:
           docker push ${{ steps.meta.outputs.image_full }}
           docker push ${{ steps.meta.outputs.image_path }}:${{ steps.meta.outputs.branch }}-latest
 
-      # Save the credentials file path as an output for the deploy job.
-      # GOOGLE_APPLICATION_CREDENTIALS is set automatically by the auth action.
-      - name: Export credentials file path
-        id: creds
-        run: echo "creds_file=${GOOGLE_APPLICATION_CREDENTIALS}" >> $GITHUB_OUTPUT
-
-      # Upload the credentials file as an artifact so the deploy job can download it.
-      # It is a short-lived token (1 hour) — safe to pass between jobs this way.
-      - name: Upload GCP credentials for deploy job
-        uses: actions/upload-artifact@v4
-        with:
-          name: gcp-credentials
-          path: ${{ steps.creds.outputs.creds_file }}
-          retention-days: 1
-
       - name: Summary
         run: |
           echo "### Image pushed" >> $GITHUB_STEP_SUMMARY
@@ -244,25 +229,9 @@ jobs:
       - name: Install Ansible
         run: pip install ansible==9.5.1
 
-      - name: Download GCP credentials
-        uses: actions/download-artifact@v4
-        with:
-          name: gcp-credentials
-          path: /tmp/gcp-creds
-
-      - name: Locate credentials file
-        id: creds
-        run: |
-          CREDS_FILE=$(ls /tmp/gcp-creds/*.json | head -1)
-          chmod 600 "$CREDS_FILE"
-          echo "path=${CREDS_FILE}" >> $GITHUB_OUTPUT
-
-      # Authenticate in THIS job so we can get a real access token.
-      # The credentials file from build-and-push cannot be reused on the server
-      # because it calls back to the GitHub OIDC endpoint which is only valid
-      # while that job is running. Once that job completes → "job is already completed".
-      # Solution: authenticate fresh here, get a static OAuth2 access token,
-      # pass it to the server. docker login uses it directly — no gcloud needed.
+      # Authenticate fresh in THIS job to get a live OAuth2 token.
+      # We do NOT reuse the credentials file from build-and-push — that file
+      # calls back to GitHub's OIDC endpoint which dies when that job ends.
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
