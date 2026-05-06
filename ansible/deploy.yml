@@ -130,20 +130,13 @@
       until: pg_ready.rc == 0
       when: postgres_running.rc != 0 or postgres_running.stdout | trim != 'true'
 
-    # ── 6. Authenticate Docker to Artifact Registry ───────────────────────────
-    # Use the OAuth2 access token obtained in the GitHub Actions runner.
-    # docker login with oauth2accesstoken works directly — no gcloud needed.
-    # The token was obtained WHILE the deploy-uat job was running (fresh WIF auth),
-    # so it is valid. The old approach (copying the WIF credentials file to the
-    # server) failed because that file calls back to GitHub's OIDC endpoint which
-    # is only alive during the build-and-push job — by deploy time it returns
-    # "job is already completed".
-    - name: Login to Artifact Registry
+
+    - name: Login to Artifact Registry with access token
       command: >
         docker login {{ gcp_region }}-docker.pkg.dev
         -u oauth2accesstoken
         -p {{ docker_token }}
-      no_log: true
+      no_log: false
 
     # ── 7. Pull new image ─────────────────────────────────────────────────────
     - name: Pull new image from Artifact Registry
