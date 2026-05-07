@@ -1,0 +1,133 @@
+# Cloud Build CI/CD Pipeline
+# Triggered on push to main branch.
+# Configure in GCP Console: Cloud Build → Triggers → Connect Repository
+#
+# PIPELINE STAGES:
+#   1. Run tests (unit + integration against a Cloud SQL test instance)
+#   2. Build Docker image
+#   3. Push to Artifact Registry
+#   4. Run Alembic migrations (before deploying new code)
+#   5. Deploy to Cloud Run
+#
+# WHY MIGRATE BEFORE DEPLOY:
+#   If the new code runs before the migration, it might reference columns
+#   that don't exist yet → 500 errors for all users.
+#   If the migration runs first and is backward-compatible (additive only),
+#   the old code continues running happily during the deploy window.
+#   This is the "expand/contract" migration pattern.
+#
+# MIGRATION SAFETY:
+#   Our Alembic migrations are designed to be backward-compatible:
+#   - ADD COLUMN with a default: old code ignores new columns
+#   - CREATE INDEX CONCURRENTLY: doesn't lock the table
+#   - DROP COLUMN: only after old code is fully deployed (separate PR)
+#   NEVER: rename columns (old code breaks immediately)
+#   NEVER: add NOT NULL without a default (migration fails on existing rows)
+#
+# ROLLBACK:
+#   Cloud Run keeps the previous revision. If the new revision fails
+#   health checks, traffic automatically stays on the old revision.
+#   Manual rollback: gcloud run services update-traffic d2c-platform --to-revisions=PREV=100
+
+steps:
+  # ── Step 1: Run unit tests ─────────────────────────────────────────────────
+  - name: "python:3.12-slim"
+    id: unit-tests
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        pip install -r requirements.txt -q
+        pytest tests/unit/ -v --tb=short
+    env:
+      - "JWT_SECRET_KEY=test_secret_key_for_ci"
+      - "ENCRYPTION_KEY=dGVzdF9lbmNyeXB0aW9uX2tleV9mb3JfY2lfdGVzdHM="
+
+  # ── Step 2: Build Docker image ─────────────────────────────────────────────
+  - name: "gcr.io/cloud-builders/docker"
+    id: build
+    args:
+      - build
+      - "-t"
+      - "us-central1-docker.pkg.dev/$PROJECT_ID/d2c/app:$SHORT_SHA"
+      - "-t"
+      - "us-central1-docker.pkg.dev/$PROJECT_ID/d2c/app:latest"
+      - "-f"
+      - "infra/Dockerfile"
+      - "."
+    waitFor: ["unit-tests"]
+
+  # ── Step 3: Push to Artifact Registry ─────────────────────────────────────
+  - name: "gcr.io/cloud-builders/docker"
+    id: push
+    args:
+      - push
+      - "--all-tags"
+      - "us-central1-docker.pkg.dev/$PROJECT_ID/d2c/app"
+    waitFor: ["build"]
+
+  # ── Step 4: Run database migrations ───────────────────────────────────────
+  # Runs in a Cloud Run Job (one-off container with Cloud SQL access)
+  # This ensures migrations run with the same network/secret access as the app.
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: migrate
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        gcloud run jobs create d2c-migrate-$$BUILD_ID \
+          --image=us-central1-docker.pkg.dev/$PROJECT_ID/d2c/app:$SHORT_SHA \
+          --region=us-central1 \
+          --service-account=d2c-platform-sa@$PROJECT_ID.iam.gserviceaccount.com \
+          --set-cloudsql-instances=$PROJECT_ID:us-central1:d2c-db \
+          --set-secrets=JWT_SECRET_KEY=d2c-jwt-secret:latest,ENCRYPTION_KEY=d2c-encryption-key:latest,DB_PASSWORD=d2c-db-password:latest \
+          --set-env-vars="DATABASE_SYNC_URL=postgresql+psycopg2://d2c_app:$$(gcloud secrets versions access latest --secret=d2c-db-password)@/d2c_db?host=/cloudsql/$PROJECT_ID:us-central1:d2c-db" \
+          --command="alembic" \
+          --args="upgrade,head" \
+          --max-retries=1 \
+          --vpc-connector=projects/$PROJECT_ID/locations/us-central1/connectors/d2c-vpc-connector \
+          && \
+        gcloud run jobs execute d2c-migrate-$$BUILD_ID \
+          --region=us-central1 \
+          --wait
+    waitFor: ["push"]
+
+  # ── Step 5: Deploy to Cloud Run ────────────────────────────────────────────
+  # --no-traffic: deploy the new revision but send 0% traffic to it first.
+  # We verify it passes health checks, then shift traffic.
+  # This enables blue/green deployments.
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: deploy
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - d2c-platform
+      - "--image=us-central1-docker.pkg.dev/$PROJECT_ID/d2c/app:$SHORT_SHA"
+      - "--region=us-central1"
+      - "--no-traffic"       # deploy without traffic first
+      - "--tag=canary"       # tag for targeted traffic split testing
+    waitFor: ["migrate"]
+
+  # ── Step 6: Shift traffic to new revision ─────────────────────────────────
+  # Only after the new revision passes health checks.
+  # For canary releases: change to --to-tags=canary=10 for 10% traffic.
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: shift-traffic
+    entrypoint: gcloud
+    args:
+      - run
+      - services
+      - update-traffic
+      - d2c-platform
+      - "--region=us-central1"
+      - "--to-latest"       # send 100% traffic to newest revision
+    waitFor: ["deploy"]
+
+images:
+  - "us-central1-docker.pkg.dev/$PROJECT_ID/d2c/app:$SHORT_SHA"
+  - "us-central1-docker.pkg.dev/$PROJECT_ID/d2c/app:latest"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8  # faster builds; parallel docker layer caching

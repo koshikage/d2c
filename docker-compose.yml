@@ -1,0 +1,144 @@
+version: "3.9"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# D2C Platform — Docker Compose
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# STEP 13 — Local Infrastructure
+# ================================
+# Brings up the full stack with: docker compose up
+#
+# Services:
+#   postgres        — PostgreSQL 16 database
+#   app             — Main FastAPI application
+#   mock-shopify    — Mock Shopify API server
+#   mock-meta       — Mock Meta Ads API server
+#
+# STARTUP ORDER:
+#   postgres → mock-shopify, mock-meta → app (waits for all three via healthchecks)
+#
+# WHY HEALTHCHECKS:
+#   depends_on alone only waits for the container to START, not be READY.
+#   The app would fail if it connected before Postgres finished initialising.
+#   Healthchecks + condition: service_healthy ensures actual readiness.
+#
+# PROS of this setup:
+#   + Single command to reproduce the entire environment on any machine
+#   + Mock servers isolated in their own containers
+#   + Named volumes persist DB data across container restarts
+#
+# CONS:
+#   - Docker networking adds latency vs localhost
+#   - Volume mounts for hot-reload require file-watch to work cross-platform
+#   - Not a production deployment (use Cloud Run + Cloud SQL in GCP)
+
+services:
+
+  # ── PostgreSQL 16 ───────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: d2c-postgres
+    environment:
+      POSTGRES_USER: d2c
+      POSTGRES_PASSWORD: d2c_secret
+      POSTGRES_DB: d2c_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U d2c -d d2c_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - d2c-network
+
+  # ── Mock Shopify API ────────────────────────────────────────────────────────
+  mock-shopify:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.mock
+      args:
+        MOCK_MODULE: mock_servers.shopify_mock:mock_shopify
+        PORT: 8001
+    container_name: d2c-mock-shopify
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/admin/api/2024-01/products.json?shop=test"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - d2c-network
+
+  # ── Mock Meta Ads API ───────────────────────────────────────────────────────
+  mock-meta:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.mock
+      args:
+        MOCK_MODULE: mock_servers.meta_mock:mock_meta
+        PORT: 8002
+    container_name: d2c-mock-meta
+    ports:
+      - "8002:8002"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/v19.0/me?access_token=test"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - d2c-network
+
+  # ── Main Application ────────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    container_name: d2c-app
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://d2c:d2c_secret@postgres:5432/d2c_db"
+      DATABASE_SYNC_URL: "postgresql+psycopg2://d2c:d2c_secret@postgres:5432/d2c_db"
+      SHOPIFY_MOCK_BASE_URL: "http://mock-shopify:8001"
+      META_MOCK_BASE_URL: "http://mock-meta:8002"
+      JWT_SECRET_KEY: "dev_jwt_secret_change_in_production_256bit"
+      ENCRYPTION_KEY: "dev_encryption_key_change_in_production_"
+      ENVIRONMENT: "development"
+      LOG_LEVEL: "INFO"
+      LOG_FORMAT: "text"
+      DEBUG: "true"
+    volumes:
+      # Hot-reload: mount source code into container
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mock-shopify:
+        condition: service_healthy
+      mock-meta:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - d2c-network
+    command: >
+      sh -c "
+        alembic upgrade head &&
+        python scripts/seed.py &&
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      "
+
+volumes:
+  postgres_data:
+
+networks:
+  d2c-network:
+    driver: bridge

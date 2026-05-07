@@ -1,0 +1,157 @@
+# Cloud Run service definition
+# Deploy with: gcloud run services replace infra/cloudrun-service.yaml --region=us-central1
+#
+# DESIGN DECISIONS:
+#
+# 1. MIN INSTANCES = 1
+#    Cold starts on Cloud Run add ~2-3 seconds to the first request after idle.
+#    For an API serving live dashboards, this is unacceptable. min-instances=1
+#    keeps one instance warm at all times. Cost: ~$5/month for a tiny instance.
+#
+# 2. MAX INSTANCES = 10
+#    Each instance holds up to 20 DB connections (pool_size=10, max_overflow=10).
+#    Cloud SQL's default connection limit is 100. 10 instances × 20 = 200 would
+#    exceed this. If you need more instances, use PgBouncer or Cloud SQL Proxy
+#    in transaction mode to multiplex connections.
+#
+#    IMPORTANT: For Cloud Run specifically, use NullPool (no connection pooling
+#    in the app) + Cloud SQL Proxy — each request opens/closes a connection.
+#    This is counterintuitive but correct: Cloud Run scales to zero and back,
+#    so a persistent pool's connections are wasted when the instance is idle.
+#    NullPool + Cloud SQL Proxy handles pooling at the proxy layer.
+#
+# 3. CONCURRENCY = 100
+#    FastAPI + asyncpg is async all the way down. Each instance can handle
+#    100 concurrent requests without blocking. The limit is DB connection
+#    availability, not CPU/thread contention.
+#
+# 4. SECRETS via Secret Manager
+#    No environment variables for secrets. Secret Manager gives:
+#    - Audit logs: who accessed which secret, when
+#    - Versioning: rotate secrets without redeploying
+#    - IAM-scoped access: only the Cloud Run service account can read these secrets
+#    - Automatic rotation hooks for Cloud SQL passwords
+#
+# 5. VPC CONNECTOR
+#    Cloud SQL Private IP is not accessible from the public internet.
+#    The VPC connector routes Cloud Run egress through the private VPC
+#    where Cloud SQL lives. This keeps DB traffic off the public internet.
+#
+# 6. CLOUD SQL CONNECTION
+#    The Cloud SQL Proxy sidecar is the recommended connection method.
+#    It handles IAM auth, SSL, and automatic reconnection. We use the
+#    Unix socket path (/cloudsql/PROJECT:REGION:INSTANCE) as the DB host.
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: d2c-platform
+  labels:
+    cloud.googleapis.com/location: us-central1
+  annotations:
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        # Scaling
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "10"
+        # Cloud SQL connection via Unix socket (no TCP, no SSL cert management)
+        run.googleapis.com/cloudsql-instances: "PROJECT_ID:us-central1:d2c-db"
+        # VPC for private Cloud SQL access
+        run.googleapis.com/vpc-access-connector: projects/PROJECT_ID/locations/us-central1/connectors/d2c-vpc-connector
+        run.googleapis.com/vpc-access-egress: private-ranges-only
+    spec:
+      serviceAccountName: d2c-platform-sa@PROJECT_ID.iam.gserviceaccount.com
+      containerConcurrency: 100
+      timeoutSeconds: 300
+      containers:
+        - image: us-central1-docker.pkg.dev/PROJECT_ID/d2c/app:latest
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          ports:
+            - containerPort: 8000
+          env:
+            # Non-secret config — safe as env vars
+            - name: ENVIRONMENT
+              value: "production"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: LOG_FORMAT
+              value: "json"
+            - name: DEBUG
+              value: "false"
+            # Cloud SQL Unix socket path — no TCP, no network
+            - name: DATABASE_URL
+              value: "postgresql+asyncpg://d2c_app:$(DB_PASSWORD)@/d2c_db?host=/cloudsql/PROJECT_ID:us-central1:d2c-db"
+            - name: DATABASE_SYNC_URL
+              value: "postgresql+psycopg2://d2c_app:$(DB_PASSWORD)@/d2c_db?host=/cloudsql/PROJECT_ID:us-central1:d2c-db"
+            # DB pool: NullPool for Cloud Run (see comment above)
+            - name: DB_POOL_SIZE
+              value: "0"       # 0 = NullPool in our config
+            # Mock server URLs (replace with real URLs in production)
+            - name: SHOPIFY_MOCK_BASE_URL
+              value: "https://shopify-mock.internal"
+            - name: META_MOCK_BASE_URL
+              value: "https://meta-mock.internal"
+          # Secrets from Secret Manager — mounted as env vars
+          # Each secret version is pinned; update to "latest" after testing rotation.
+          envFrom: []
+          # Individual secret references
+          env:
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: d2c-jwt-secret
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: d2c-encryption-key
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: d2c-db-password
+            - name: SHOPIFY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: d2c-shopify-client-secret
+            - name: SHOPIFY_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: d2c-shopify-webhook-secret
+            - name: META_APP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: d2c-meta-app-secret
+            # Non-secret config (repeated from above — env order matters)
+            - name: ENVIRONMENT
+              value: "production"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: LOG_FORMAT
+              value: "json"
+            - name: DEBUG
+              value: "false"
+            - name: DB_POOL_SIZE
+              value: "0"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 3
+            periodSeconds: 10

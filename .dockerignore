@@ -1,0 +1,146 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# .dockerignore — D2C Platform
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# PURPOSE:
+#   Controls what gets sent to the Docker build daemon as the "build context".
+#   When you run `docker build .` Docker tars everything in the current directory
+#   and uploads it to the daemon BEFORE the first Dockerfile instruction runs.
+#
+# WHY THIS MATTERS:
+#   Without .dockerignore, `docker build` uploads your entire project including:
+#     - .git/          (~50-200MB for a mature repo)
+#     - .venv/         (~300MB of installed packages)
+#     - node_modules/  (if any frontend exists)
+#     - *.log files    (potentially containing secrets in stack traces)
+#
+#   A bloated build context means:
+#     - Slow builds: all that data is uploaded and extracted every time
+#     - Fat layers: COPY . . pulls in dev files that should never be in production
+#     - Security risk: .env files, credentials, logs end up IN the image
+#       and are readable by anyone with docker pull / docker run access
+#
+# RULE OF THUMB:
+#   Exclude everything, then whitelist what the app actually needs to run.
+#   Our app needs: app/, migrations/, mock_servers/, scripts/, requirements.txt
+#   It does NOT need: .git, tests, .venv, infra docs, editor configs, local envs
+#
+# HOW TO CHECK WHAT'S IN YOUR IMAGE:
+#   docker build -t d2c-app .
+#   docker run --rm d2c-app find /app -type f | sort
+#   # Anything surprising there? Add it to this file.
+#
+# HOW TO CHECK CONTEXT SIZE BEFORE BUILDING:
+#   tar -czh . | wc -c   # bytes sent to daemon (with .dockerignore respected)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ── SECRETS — most critical ────────────────────────────────────────────────────
+# .env files must NEVER end up inside a Docker image.
+# Images are often pushed to registries (GCR, Docker Hub). Anyone who can
+# pull the image can run `docker run --rm d2c-app cat /app/.env` and get
+# your production database password and JWT signing key.
+.env
+.env.*
+!.env.example
+
+# GCP service account keys
+*.json
+!package.json
+
+# ── GIT ───────────────────────────────────────────────────────────────────────
+# .git is the biggest single directory to exclude.
+# It contains full commit history, all branches, and developer email addresses.
+# The app process has no use for it at runtime.
+# Size impact: small repos ~10MB, mature repos ~200MB+ — all wasted in the image.
+.git/
+.gitignore
+.gitattributes
+
+# ── PYTHON RUNTIME ARTIFACTS ──────────────────────────────────────────────────
+# __pycache__ from your local dev machine is compiled for YOUR Python version
+# and architecture. Inside the container Python recompiles from .py source.
+# Including them causes:
+#   - Unnecessary bytes in the image
+#   - Potential import errors if your local Python version differs from the image
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+
+# Local virtual environment — never copy this into the image.
+# The Dockerfile runs `pip install -r requirements.txt` which creates a fresh
+# install inside the container. Your local .venv has paths like
+# /Users/you/.venv/lib/... that point to your machine, not the container.
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# ── TESTS ────────────────────────────────────────────────────────────────────
+# Tests are not needed at runtime. Excluding them:
+#   - Reduces image size (test files + fixtures can be large)
+#   - Prevents test dependencies (pytest, aiosqlite) from being importable
+#     at runtime (they shouldn't be installed in the prod image either, but
+#     belt-and-suspenders)
+#   - Avoids accidentally running tests on container start
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# ── INFRASTRUCTURE & DEPLOYMENT DOCS ─────────────────────────────────────────
+# These files are used to BUILD and DEPLOY the image, not to RUN it.
+# The running container has no use for its own Dockerfile or Cloud Build config.
+infra/
+# Exception: keep the Dockerfile itself excluded — container doesn't need it
+Dockerfile
+Dockerfile.*
+docker-compose.yml
+docker-compose.*.yml
+
+# ── DOCUMENTATION ─────────────────────────────────────────────────────────────
+# README and docs are useful for humans, not for the Python process running in
+# the container. Excluding them keeps the image lean.
+README.md
+*.md
+docs/
+
+# ── EDITORS & OS FILES ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── LOGS ────────────────────────────────────────────────────────────────────
+# Any local log files — could contain sensitive runtime data
+*.log
+logs/
+
+# ── TYPE CHECKING / LINTING CACHES ────────────────────────────────────────────
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WHAT IS EXPLICITLY INCLUDED (everything not listed above):
+#
+#   app/              ← the FastAPI application
+#   migrations/       ← Alembic migration scripts (run on startup)
+#   mock_servers/     ← mock Shopify + Meta API servers
+#   scripts/          ← seed.py and other one-off scripts
+#   requirements.txt  ← pip dependencies
+#   alembic.ini       ← Alembic configuration
+#   pyproject.toml    ← pytest + tool configuration
+#
+# Total approximate build context size: ~200KB (vs ~500MB+ without this file)
+# ══════════════════════════════════════════════════════════════════════════════
